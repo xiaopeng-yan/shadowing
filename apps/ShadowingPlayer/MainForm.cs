@@ -38,6 +38,7 @@ namespace ShadowingPlayer
         private readonly ComboBox speedCombo = new ComboBox();
         private readonly ComboBox whisperModelCombo = new ComboBox();
         private readonly NumericUpDown timingStepInput = new NumericUpDown();
+        private readonly Label whisperModelStatusLabel = new Label();
         private readonly Label statusLabel = new Label();
         private readonly Panel playerPanel = new Panel();
         private readonly RichTextBox transcriptBox = new RichTextBox();
@@ -115,6 +116,12 @@ namespace ShadowingPlayer
             whisperModelCombo.Width = 96;
             whisperModelCombo.Items.AddRange(new object[] { "base", "small", "medium", "large-v3" });
             whisperModelCombo.SelectedIndex = 1;
+            whisperModelCombo.SelectedIndexChanged += delegate { UpdateWhisperModelStatus(); };
+
+            whisperModelStatusLabel.AutoSize = false;
+            whisperModelStatusLabel.Width = 112;
+            whisperModelStatusLabel.Height = 28;
+            whisperModelStatusLabel.TextAlign = ContentAlignment.MiddleLeft;
 
             subtitlesButton.Text = "Subtitles: On";
             subtitlesButton.Width = 112;
@@ -193,6 +200,7 @@ namespace ShadowingPlayer
             toolbar.Controls.Add(transcribeButton);
             toolbar.Controls.Add(new Label { Text = "Model", AutoSize = true, Padding = new Padding(8, 6, 0, 0) });
             toolbar.Controls.Add(whisperModelCombo);
+            toolbar.Controls.Add(whisperModelStatusLabel);
             toolbar.Controls.Add(subtitlesButton);
             toolbar.Controls.Add(sentenceModeButton);
             toolbar.Controls.Add(previousSentenceButton);
@@ -245,6 +253,7 @@ namespace ShadowingPlayer
             Controls.Add(transcriptBox);
             Controls.Add(toolbar);
             FormClosing += async delegate { await ShutdownAsync(); };
+            UpdateWhisperModelStatus();
         }
 
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
@@ -402,6 +411,7 @@ namespace ShadowingPlayer
                 statusLabel.Text = "Transcribing with " + modelName + "...";
 
                 await RunTranscriptionAsync(pythonPath, scriptPath, currentVideoPath, srtPath, modelName);
+                UpdateWhisperModelStatus();
                 await LoadTranscriptFromSrtAsync(srtPath, "Transcript saved and loaded as subtitles.");
             }
             catch (Exception ex)
@@ -1108,6 +1118,49 @@ namespace ShadowingPlayer
         {
             var selected = whisperModelCombo.SelectedItem as string;
             return string.IsNullOrWhiteSpace(selected) ? "small" : selected;
+        }
+
+        private void UpdateWhisperModelStatus()
+        {
+            var modelName = GetSelectedWhisperModel();
+            var downloaded = IsWhisperModelDownloaded(modelName);
+            whisperModelStatusLabel.Text = downloaded ? "Downloaded" : "Not downloaded";
+            whisperModelStatusLabel.ForeColor = downloaded ? Color.FromArgb(0, 120, 80) : Color.FromArgb(170, 90, 0);
+        }
+
+        private static bool IsWhisperModelDownloaded(string modelName)
+        {
+            var modelFolder = GetWhisperModelCachePath(modelName);
+            var snapshotsFolder = Path.Combine(modelFolder, "snapshots");
+            if (!Directory.Exists(snapshotsFolder))
+            {
+                return false;
+            }
+
+            foreach (var snapshot in Directory.GetDirectories(snapshotsFolder))
+            {
+                if (Directory.GetFiles(snapshot, "*", SearchOption.AllDirectories).Length > 0)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static string GetWhisperModelCachePath(string modelName)
+        {
+            return Path.Combine(
+                WhisperModelCacheRoot,
+                "hub",
+                "models--Systran--faster-whisper-" + SanitizeHuggingFaceCacheName(modelName));
+        }
+
+        private static string SanitizeHuggingFaceCacheName(string value)
+        {
+            return string.IsNullOrWhiteSpace(value)
+                ? "small"
+                : value.Replace("/", "--").Replace("\\", "--");
         }
 
         private static string GetTranscriptCachePath(string videoPath, string modelName)
