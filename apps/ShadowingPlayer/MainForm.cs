@@ -14,6 +14,7 @@ namespace ShadowingPlayer
     public sealed class MainForm : Form
     {
         private const double MaxSentencePlaybackSeconds = 20.0;
+        private const int MinimumSentenceDurationMilliseconds = 50;
         private const string WhisperModelCacheRoot = @"E:\Models";
         private static readonly Color CurrentSentenceColor = Color.FromArgb(0, 102, 204);
 
@@ -29,13 +30,19 @@ namespace ShadowingPlayer
         private readonly Button previousSentenceButton = new Button();
         private readonly Button nextSentenceButton = new Button();
         private readonly Button repeatSentenceButton = new Button();
+        private readonly Button sentenceStartEarlierButton = new Button();
+        private readonly Button sentenceStartLaterButton = new Button();
+        private readonly Button sentenceEndEarlierButton = new Button();
+        private readonly Button sentenceEndLaterButton = new Button();
         private readonly ComboBox speedCombo = new ComboBox();
         private readonly ComboBox whisperModelCombo = new ComboBox();
+        private readonly NumericUpDown timingStepInput = new NumericUpDown();
         private readonly Label statusLabel = new Label();
         private readonly RichTextBox transcriptBox = new RichTextBox();
         private readonly List<TranscriptSegment> transcriptSegments = new List<TranscriptSegment>();
         private MpvController mpv;
         private string currentVideoPath;
+        private string currentTranscriptPath;
         private bool subtitlesVisible = true;
         private bool sentenceModeEnabled;
         private int currentSentenceIndex = -1;
@@ -125,6 +132,34 @@ namespace ShadowingPlayer
             nextSentenceButton.Enabled = false;
             nextSentenceButton.Click += async delegate { await MoveSentenceAsync(1); };
 
+            sentenceStartEarlierButton.Text = "Start -";
+            sentenceStartEarlierButton.Width = 72;
+            sentenceStartEarlierButton.Enabled = false;
+            sentenceStartEarlierButton.Click += async delegate { await AdjustSentenceBoundaryAsync(true, -1); };
+
+            sentenceStartLaterButton.Text = "Start +";
+            sentenceStartLaterButton.Width = 72;
+            sentenceStartLaterButton.Enabled = false;
+            sentenceStartLaterButton.Click += async delegate { await AdjustSentenceBoundaryAsync(true, 1); };
+
+            sentenceEndEarlierButton.Text = "End -";
+            sentenceEndEarlierButton.Width = 72;
+            sentenceEndEarlierButton.Enabled = false;
+            sentenceEndEarlierButton.Click += async delegate { await AdjustSentenceBoundaryAsync(false, -1); };
+
+            sentenceEndLaterButton.Text = "End +";
+            sentenceEndLaterButton.Width = 72;
+            sentenceEndLaterButton.Enabled = false;
+            sentenceEndLaterButton.Click += async delegate { await AdjustSentenceBoundaryAsync(false, 1); };
+
+            timingStepInput.DecimalPlaces = 2;
+            timingStepInput.Increment = 0.05M;
+            timingStepInput.Minimum = 0.01M;
+            timingStepInput.Maximum = 5M;
+            timingStepInput.Value = 0.10M;
+            timingStepInput.Width = 64;
+            timingStepInput.Enabled = false;
+
             speedCombo.DropDownStyle = ComboBoxStyle.DropDownList;
             speedCombo.Width = 90;
             speedCombo.Items.AddRange(new object[] { "0.75x", "1.0x", "1.25x", "1.5x", "2.0x" });
@@ -150,6 +185,12 @@ namespace ShadowingPlayer
             toolbar.Controls.Add(previousSentenceButton);
             toolbar.Controls.Add(repeatSentenceButton);
             toolbar.Controls.Add(nextSentenceButton);
+            toolbar.Controls.Add(sentenceStartEarlierButton);
+            toolbar.Controls.Add(sentenceStartLaterButton);
+            toolbar.Controls.Add(sentenceEndEarlierButton);
+            toolbar.Controls.Add(sentenceEndLaterButton);
+            toolbar.Controls.Add(new Label { Text = "Step", AutoSize = true, Padding = new Padding(8, 6, 0, 0) });
+            toolbar.Controls.Add(timingStepInput);
             toolbar.Controls.Add(new Label { Text = "Speed", AutoSize = true, Padding = new Padding(8, 6, 0, 0) });
             toolbar.Controls.Add(speedCombo);
             toolbar.Controls.Add(statusLabel);
@@ -243,6 +284,7 @@ namespace ShadowingPlayer
                     }
 
                     currentVideoPath = dialog.FileName;
+                    currentTranscriptPath = null;
                     transcriptSegments.Clear();
                     currentSentenceIndex = -1;
                     subtitlesVisible = true;
@@ -341,6 +383,7 @@ namespace ShadowingPlayer
         {
             transcriptSegments.Clear();
             transcriptSegments.AddRange(ParseSrtFile(srtPath));
+            currentTranscriptPath = srtPath;
             currentSentenceIndex = transcriptSegments.Count > 0 ? 0 : -1;
             transcriptBox.Text = BuildTranscriptText(message, transcriptSegments);
 
@@ -446,6 +489,110 @@ namespace ShadowingPlayer
             {
                 statusLabel.Text = ex.Message;
             }
+        }
+
+        private async Task AdjustSentenceBoundaryAsync(bool adjustStart, int direction)
+        {
+            try
+            {
+                if (mpv == null || transcriptSegments.Count == 0)
+                {
+                    statusLabel.Text = "Transcribe the video first.";
+                    return;
+                }
+
+                if (currentSentenceIndex < 0)
+                {
+                    currentSentenceIndex = 0;
+                }
+
+                currentSentenceIndex = Math.Max(0, Math.Min(transcriptSegments.Count - 1, currentSentenceIndex));
+                var changed = adjustStart
+                    ? AdjustSentenceStart(currentSentenceIndex, direction)
+                    : AdjustSentenceEnd(currentSentenceIndex, direction);
+
+                if (!changed)
+                {
+                    statusLabel.Text = "Sentence boundary cannot move further.";
+                    return;
+                }
+
+                if (!string.IsNullOrWhiteSpace(currentTranscriptPath))
+                {
+                    WriteSrtFile(currentTranscriptPath, transcriptSegments);
+                }
+
+                transcriptBox.Text = BuildTranscriptText("Adjusted transcript timing.", transcriptSegments);
+                SelectCurrentSentenceText();
+
+                await LoadSentenceSegmentsIntoPlayerAsync();
+                if (sentenceModeEnabled)
+                {
+                    await mpv.PlaySentenceAsync(currentSentenceIndex + 1);
+                }
+
+                var boundary = adjustStart
+                    ? transcriptSegments[currentSentenceIndex].Start
+                    : GetEffectiveSentenceEnd(currentSentenceIndex);
+                statusLabel.Text =
+                    "Sentence " + (currentSentenceIndex + 1) + " " +
+                    (adjustStart ? "start" : "end") + " " +
+                    FormatDisplayTime(boundary);
+            }
+            catch (Exception ex)
+            {
+                statusLabel.Text = ex.Message;
+            }
+        }
+
+        private bool AdjustSentenceStart(int sentenceIndex, int direction)
+        {
+            var segment = transcriptSegments[sentenceIndex];
+            var minimumGap = TimeSpan.FromMilliseconds(MinimumSentenceDurationMilliseconds);
+            var proposed = AddStep(segment.Start, direction);
+            var minimum = sentenceIndex > 0
+                ? transcriptSegments[sentenceIndex - 1].Start + minimumGap
+                : TimeSpan.Zero;
+            var maximum = segment.End - minimumGap;
+            var adjusted = Clamp(proposed, minimum, maximum);
+
+            if (adjusted == segment.Start)
+            {
+                return false;
+            }
+
+            segment.SetStart(adjusted);
+            if (sentenceIndex > 0)
+            {
+                transcriptSegments[sentenceIndex - 1].SetEnd(adjusted);
+            }
+
+            return true;
+        }
+
+        private bool AdjustSentenceEnd(int sentenceIndex, int direction)
+        {
+            var segment = transcriptSegments[sentenceIndex];
+            var minimumGap = TimeSpan.FromMilliseconds(MinimumSentenceDurationMilliseconds);
+            var proposed = AddStep(GetEffectiveSentenceEnd(sentenceIndex), direction);
+            var minimum = segment.Start + minimumGap;
+            var maximum = sentenceIndex + 1 < transcriptSegments.Count
+                ? transcriptSegments[sentenceIndex + 1].End - minimumGap
+                : TimeSpan.MaxValue;
+            var adjusted = Clamp(proposed, minimum, maximum);
+
+            if (adjusted == GetEffectiveSentenceEnd(sentenceIndex))
+            {
+                return false;
+            }
+
+            segment.SetEnd(adjusted);
+            if (sentenceIndex + 1 < transcriptSegments.Count)
+            {
+                transcriptSegments[sentenceIndex + 1].SetStart(adjusted);
+            }
+
+            return true;
         }
 
         private async Task PlayCurrentSentenceAsync()
@@ -579,6 +726,36 @@ namespace ShadowingPlayer
             return end;
         }
 
+        private TimeSpan AddStep(TimeSpan value, int direction)
+        {
+            return value + TimeSpan.FromTicks(GetTimingStep().Ticks * direction);
+        }
+
+        private TimeSpan GetTimingStep()
+        {
+            return TimeSpan.FromSeconds((double)timingStepInput.Value);
+        }
+
+        private static TimeSpan Clamp(TimeSpan value, TimeSpan minimum, TimeSpan maximum)
+        {
+            if (maximum < minimum)
+            {
+                maximum = minimum;
+            }
+
+            if (value < minimum)
+            {
+                return minimum;
+            }
+
+            if (value > maximum)
+            {
+                return maximum;
+            }
+
+            return value;
+        }
+
         private void UpdateSentenceModeButtons()
         {
             var hasSentences = transcriptSegments.Count > 0;
@@ -586,13 +763,26 @@ namespace ShadowingPlayer
             previousSentenceButton.Enabled = hasSentences && sentenceModeEnabled;
             repeatSentenceButton.Enabled = hasSentences && sentenceModeEnabled;
             nextSentenceButton.Enabled = hasSentences && sentenceModeEnabled;
+            sentenceStartEarlierButton.Enabled = hasSentences;
+            sentenceStartLaterButton.Enabled = hasSentences;
+            sentenceEndEarlierButton.Enabled = hasSentences;
+            sentenceEndLaterButton.Enabled = hasSentences;
+            timingStepInput.Enabled = hasSentences;
             sentenceModeButton.Text = sentenceModeEnabled ? "Sentence: On" : "Sentence: Off";
         }
 
         private void SelectCurrentSentenceText()
         {
+            transcriptBox.SuspendLayout();
+            transcriptBox.SelectAll();
+            transcriptBox.SelectionColor = SystemColors.WindowText;
+            transcriptBox.SelectionBackColor = SystemColors.Window;
+            transcriptBox.SelectionFont = transcriptBox.Font;
+
             if (currentSentenceIndex < 0 || currentSentenceIndex >= transcriptSegments.Count)
             {
+                transcriptBox.Select(0, 0);
+                transcriptBox.ResumeLayout();
                 return;
             }
 
@@ -604,8 +794,14 @@ namespace ShadowingPlayer
                 var nextStart = transcriptBox.Text.IndexOf(Environment.NewLine, start, StringComparison.Ordinal);
                 var length = nextStart >= 0 ? nextStart - start : transcriptBox.Text.Length - start;
                 transcriptBox.Select(start, length);
+                transcriptBox.SelectionColor = CurrentSentenceColor;
+                transcriptBox.SelectionBackColor = Color.FromArgb(232, 244, 255);
+                transcriptBox.SelectionFont = new Font(transcriptBox.Font, FontStyle.Bold);
+                transcriptBox.Select(start, 0);
                 transcriptBox.ScrollToCaret();
             }
+
+            transcriptBox.ResumeLayout();
         }
 
         private double GetSelectedSpeed()
@@ -727,6 +923,21 @@ namespace ShadowingPlayer
             return builder.ToString().TrimEnd();
         }
 
+        private static void WriteSrtFile(string path, List<TranscriptSegment> segments)
+        {
+            using (var writer = new StreamWriter(path, false, Encoding.UTF8))
+            {
+                for (var i = 0; i < segments.Count; i++)
+                {
+                    var segment = segments[i];
+                    writer.WriteLine(i + 1);
+                    writer.WriteLine(FormatSrtTime(segment.Start) + " --> " + FormatSrtTime(segment.End));
+                    writer.WriteLine(segment.Text);
+                    writer.WriteLine();
+                }
+            }
+        }
+
         private static List<TranscriptSegment> ParseSrtFile(string path)
         {
             var segments = new List<TranscriptSegment>();
@@ -800,6 +1011,11 @@ namespace ShadowingPlayer
                 time.Minutes,
                 time.Seconds,
                 time.Milliseconds);
+        }
+
+        private static string FormatSrtTime(TimeSpan time)
+        {
+            return FormatDisplayTime(time).Replace(".", ",");
         }
 
         private async Task ChangeSpeedAsync()
@@ -900,6 +1116,16 @@ namespace ShadowingPlayer
             public TimeSpan End { get; private set; }
 
             public string Text { get; private set; }
+
+            public void SetStart(TimeSpan start)
+            {
+                Start = start;
+            }
+
+            public void SetEnd(TimeSpan end)
+            {
+                End = end;
+            }
         }
     }
 }
