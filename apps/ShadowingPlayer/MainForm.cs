@@ -64,6 +64,7 @@ namespace ShadowingPlayer
         private bool isShutdownInProgress;
         private bool transcriptModelSelectionBusy;
         private int currentSentenceIndex = -1;
+        private int transcriptSyncGeneration;
         private string currentTranscriptModel;
 
         public MainForm()
@@ -759,26 +760,11 @@ namespace ShadowingPlayer
                     return;
                 }
 
-                if (!string.IsNullOrWhiteSpace(currentVideoPath))
-                {
-                    SaveUserEditedMasterTranscript(currentVideoPath, currentTranscriptModel, transcriptSegments);
-                    SyncMasterTranscriptTimings(currentVideoPath);
-                }
-
-                transcriptBox.Text = BuildTranscriptText("Adjusted transcript timing.", transcriptSegments);
-                SelectCurrentSentenceText();
-
-                await LoadSentenceSegmentsIntoPlayerAsync();
-                await RefreshLoadedSubtitlesAsync();
-                UpdateWaveformSentences();
-                if (sentenceModeEnabled)
-                {
-                    await PlaySentenceAtCurrentIndexAsync();
-                }
-
                 var boundary = adjustStart
                     ? transcriptSegments[targetIndex].Start
                     : GetEffectiveSentenceEnd(targetIndex);
+
+                await CommitTranscriptStructureChangeAsync("Adjusted transcript timing.");
                 statusLabel.Text =
                     "Sentence " + (targetIndex + 1) + " " +
                     (adjustStart ? "start" : "end") + " " +
@@ -873,23 +859,7 @@ namespace ShadowingPlayer
                     return;
                 }
 
-                if (!string.IsNullOrWhiteSpace(currentVideoPath))
-                {
-                    SaveUserEditedMasterTranscript(currentVideoPath, currentTranscriptModel, transcriptSegments);
-                    SyncMasterTranscriptTimings(currentVideoPath);
-                }
-
-                transcriptBox.Text = BuildTranscriptText("Adjusted transcript timing.", transcriptSegments);
-                SelectCurrentSentenceText();
-                await LoadSentenceSegmentsIntoPlayerAsync();
-                await RefreshLoadedSubtitlesAsync();
-                UpdateWaveformSentences();
-
-                if (sentenceModeEnabled)
-                {
-                    await PlaySentenceAtCurrentIndexAsync();
-                }
-
+                await CommitTranscriptStructureChangeAsync("Adjusted transcript timing.");
                 statusLabel.Text = "Sentence " + (targetIndex + 1) + " boundary " + FormatDisplayTime(boundary);
             });
         }
@@ -1056,7 +1026,7 @@ namespace ShadowingPlayer
             if (!string.IsNullOrWhiteSpace(currentVideoPath))
             {
                 SaveUserEditedMasterTranscript(currentVideoPath, currentTranscriptModel, transcriptSegments);
-                SyncMasterTranscriptTimings(currentVideoPath);
+                ScheduleMasterTranscriptSync(currentVideoPath, currentTranscriptPath);
             }
 
             transcriptBox.Text = BuildTranscriptText(message, transcriptSegments);
@@ -1091,6 +1061,32 @@ namespace ShadowingPlayer
             currentSentenceIndex = transcriptSegments.Count == 0
                 ? -1
                 : Math.Max(0, Math.Min(transcriptSegments.Count - 1, currentSentenceIndex));
+        }
+
+        private void ScheduleMasterTranscriptSync(string videoPath, string skipTranscriptPath)
+        {
+            var generation = System.Threading.Interlocked.Increment(ref transcriptSyncGeneration);
+            Task.Run(delegate
+            {
+                try
+                {
+                    SyncMasterTranscriptTimings(videoPath, skipTranscriptPath);
+                    if (!IsDisposed && generation == transcriptSyncGeneration)
+                    {
+                        BeginInvoke(new Action(delegate
+                        {
+                            if (!IsDisposed && generation == transcriptSyncGeneration)
+                            {
+                                UpdateTranscriptModelStatus();
+                            }
+                        }));
+                    }
+                }
+                catch
+                {
+                    // Background syncing should never block the edit that the user just made.
+                }
+            });
         }
 
         private async Task SeekFromWaveformAsync(TimeSpan position)
@@ -1881,17 +1877,31 @@ namespace ShadowingPlayer
 
         private static void SyncMasterTranscriptTimings(string videoPath)
         {
+            SyncMasterTranscriptTimings(videoPath, null);
+        }
+
+        private static void SyncMasterTranscriptTimings(string videoPath, string skipTranscriptPath)
+        {
             TranscriptMasterFile master;
             if (!TryLoadMasterTranscript(videoPath, out master))
             {
                 return;
             }
 
+            var normalizedSkipPath = string.IsNullOrWhiteSpace(skipTranscriptPath)
+                ? null
+                : Path.GetFullPath(skipTranscriptPath);
             var timings = ConvertMasterTimings(master);
             foreach (var modelName in GetKnownWhisperModels())
             {
                 var transcriptPath = GetTranscriptCachePath(videoPath, modelName);
                 if (!File.Exists(transcriptPath))
+                {
+                    continue;
+                }
+
+                if (!string.IsNullOrWhiteSpace(normalizedSkipPath) &&
+                    string.Equals(Path.GetFullPath(transcriptPath), normalizedSkipPath, StringComparison.OrdinalIgnoreCase))
                 {
                     continue;
                 }
