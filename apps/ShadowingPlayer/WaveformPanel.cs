@@ -31,6 +31,10 @@ namespace ShadowingPlayer
 
         public event EventHandler<WaveformSeekEventArgs> SeekRequested;
 
+        public event EventHandler<WaveformStopPointEventArgs> StopPointAddRequested;
+
+        public event EventHandler<WaveformStopPointDeleteEventArgs> StopPointDeleteRequested;
+
         public void SetWaveform(float[] values, double duration)
         {
             peaks = values ?? new float[0];
@@ -84,6 +88,7 @@ namespace ShadowingPlayer
             DrawBoundary(graphics, window, true);
             DrawBoundary(graphics, window, false);
             DrawPlayhead(graphics, window);
+            DrawSentenceIndex(graphics);
         }
 
         protected override void OnMouseDown(MouseEventArgs e)
@@ -168,6 +173,10 @@ namespace ShadowingPlayer
                     handler(this, new WaveformSeekEventArgs(XToTime(e.X, GetVisibleWindow())));
                 }
             }
+            else if (e.Button == MouseButtons.Right && peaks.Length > 0 && durationSeconds > 0 && HasCurrentSentence())
+            {
+                HandleStopPointRightClick(e.X);
+            }
         }
 
         private void DrawCenteredMessage(Graphics graphics, string text)
@@ -185,6 +194,46 @@ namespace ShadowingPlayer
             if (handler != null)
             {
                 handler(this, EventArgs.Empty);
+            }
+        }
+
+        private void HandleStopPointRightClick(int x)
+        {
+            var window = GetVisibleWindow();
+            var sentence = GetCurrentSentence();
+            var startX = TimeToX(sentence.StartSeconds, window);
+            var endX = TimeToX(sentence.EndSeconds, window);
+
+            if (Math.Abs(x - startX) <= 8)
+            {
+                var deleteHandler = StopPointDeleteRequested;
+                if (deleteHandler != null)
+                {
+                    deleteHandler(this, new WaveformStopPointDeleteEventArgs(true));
+                }
+
+                return;
+            }
+
+            if (Math.Abs(x - endX) <= 8)
+            {
+                var deleteHandler = StopPointDeleteRequested;
+                if (deleteHandler != null)
+                {
+                    deleteHandler(this, new WaveformStopPointDeleteEventArgs(false));
+                }
+
+                return;
+            }
+
+            var seconds = XToTime(x, window);
+            if (seconds > sentence.StartSeconds && seconds < sentence.EndSeconds)
+            {
+                var addHandler = StopPointAddRequested;
+                if (addHandler != null)
+                {
+                    addHandler(this, new WaveformStopPointEventArgs(seconds));
+                }
             }
         }
 
@@ -253,6 +302,25 @@ namespace ShadowingPlayer
             using (var pen = new Pen(Color.FromArgb(255, 92, 92), 2f))
             {
                 graphics.DrawLine(pen, x, 0, x, Height);
+            }
+        }
+
+        private void DrawSentenceIndex(Graphics graphics)
+        {
+            if (!HasCurrentSentence())
+            {
+                return;
+            }
+
+            var text = "Sentence " + (currentSentenceIndex + 1) + " / " + sentences.Count;
+            using (var font = new Font(Font.FontFamily, Math.Max(8.0f, Font.Size), FontStyle.Bold))
+            using (var textBrush = new SolidBrush(Color.FromArgb(235, 245, 255)))
+            using (var backgroundBrush = new SolidBrush(Color.FromArgb(170, 15, 20, 28)))
+            {
+                var size = graphics.MeasureString(text, font);
+                var rect = new RectangleF(8, 6, size.Width + 12, size.Height + 6);
+                graphics.FillRectangle(backgroundBrush, rect);
+                graphics.DrawString(text, font, textBrush, rect.Left + 6, rect.Top + 3);
             }
         }
 
@@ -383,5 +451,25 @@ namespace ShadowingPlayer
         }
 
         public double Seconds { get; private set; }
+    }
+
+    public sealed class WaveformStopPointEventArgs : EventArgs
+    {
+        public WaveformStopPointEventArgs(double seconds)
+        {
+            Seconds = seconds;
+        }
+
+        public double Seconds { get; private set; }
+    }
+
+    public sealed class WaveformStopPointDeleteEventArgs : EventArgs
+    {
+        public WaveformStopPointDeleteEventArgs(bool deleteStartBoundary)
+        {
+            DeleteStartBoundary = deleteStartBoundary;
+        }
+
+        public bool DeleteStartBoundary { get; private set; }
     }
 }

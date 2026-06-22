@@ -184,6 +184,14 @@ namespace ShadowingPlayer
             return SendCommandAsync("sub-add", path, "cached", "Generated transcript");
         }
 
+        // Re-reads the currently selected subtitle track from disk. Used after the
+        // transcript SRT is rewritten by an edit so the on-video overlay matches the
+        // new segmentation instead of showing the stale boundaries.
+        public Task ReloadSubtitleAsync()
+        {
+            return SendCommandAsync("sub-reload");
+        }
+
         public Task SetSubtitleVisibilityAsync(bool visible)
         {
             return SendCommandAsync("set_property", "sub-visibility", visible);

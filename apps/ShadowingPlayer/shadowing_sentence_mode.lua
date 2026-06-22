@@ -28,8 +28,7 @@ timer = mp.add_periodic_timer(0.02, function()
 
     if position >= segment["end"] then
         mp.set_property_bool("pause", true)
-        timer:stop()  -- FIX 1: was timer:kill() which permanently destroys the timer.
-                      -- stop() pauses it so timer:resume() works on the next sentence.
+        enabled = false
     end
 end, true)
 
@@ -78,6 +77,10 @@ local function start_timer()
     timer:resume()
 end
 
+local function publish_current_index()
+    mp.set_property("user-data/shadow/index", tostring(current_index - 1))
+end
+
 local function play_index(index)
     if #segments == 0 then
         return
@@ -86,10 +89,7 @@ local function play_index(index)
     current_index = clamp_index(index)
     local segment = segments[current_index]
 
-    -- FIX 3: write current index into user-data so C# can read it back
-    -- through the existing pipe without opening a second connection.
-    -- Value is 0-based to match C# indexing convention.
-    mp.set_property("user-data/shadow/index", tostring(current_index - 1))
+    publish_current_index()
 
     seek_grace_until = mp.get_time() + 0.7
     enabled = true
@@ -99,19 +99,28 @@ local function play_index(index)
 end
 
 mp.register_script_message("load", function(json)
+    local was_enabled = enabled
     local parsed = utils.parse_json(json or "")
     if type(parsed) ~= "table" then
         segments = {}
         current_index = 1
         enabled = false
-        timer:stop()  -- FIX 1: was timer:kill()
+        publish_current_index()
         return
     end
 
     segments = parsed
     current_index = clamp_index(current_index)
-    enabled = false
-    timer:stop()  -- FIX 1: was timer:kill()
+    publish_current_index()
+
+    if was_enabled and #segments > 0 then
+        enabled = true
+        seek_grace_until = mp.get_time() + 0.25
+        start_timer()
+    else
+        enabled = false
+        start_timer()
+    end
 end)
 
 mp.register_script_message("enable", function()
@@ -121,6 +130,7 @@ mp.register_script_message("enable", function()
 
     local position = mp.get_property_number("time-pos", 0)
     current_index = find_sentence_at(position)
+    publish_current_index()
     seek_grace_until = 0
     enabled = true
     mp.set_property_bool("pause", false)
@@ -129,7 +139,8 @@ end)
 
 mp.register_script_message("disable", function()
     enabled = false
-    timer:stop()  -- FIX 1: was timer:kill()
+    start_timer()
+    publish_current_index()
 end)
 
 mp.register_script_message("play", function(index)

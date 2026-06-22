@@ -59,6 +59,7 @@ namespace ShadowingPlayer
         private bool sentenceModeEnabled;
         private bool waveformVisible;
         private bool waveformTimerBusy;
+        private bool waveformEditInProgress;
         private bool isClosingConfirmed;
         private bool isShutdownInProgress;
         private bool transcriptModelSelectionBusy;
@@ -256,6 +257,14 @@ namespace ShadowingPlayer
             waveformPanel.SeekRequested += async delegate(object sender, WaveformSeekEventArgs args)
             {
                 await SeekFromWaveformAsync(TimeSpan.FromSeconds(args.Seconds));
+            };
+            waveformPanel.StopPointAddRequested += async delegate(object sender, WaveformStopPointEventArgs args)
+            {
+                await AddStopPointFromWaveformAsync(TimeSpan.FromSeconds(args.Seconds));
+            };
+            waveformPanel.StopPointDeleteRequested += async delegate(object sender, WaveformStopPointDeleteEventArgs args)
+            {
+                await DeleteStopPointFromWaveformAsync(args.DeleteStartBoundary);
             };
 
             waveformTimer.Interval = 150;
@@ -645,6 +654,8 @@ namespace ShadowingPlayer
                 return;
             }
 
+            // Defensive: never start the waveform with a stale edit guard held.
+            waveformEditInProgress = false;
             await EnsureWaveformLoadedAsync();
             UpdateWaveformSentences();
             waveformTimer.Start();
@@ -711,14 +722,7 @@ namespace ShadowingPlayer
                 currentSentenceIndex = Math.Max(0, Math.Min(transcriptSegments.Count - 1, currentSentenceIndex + offset));
                 UpdateCurrentSentenceStatus();
 
-                if (offset < 0)
-                {
-                    await mpv.PreviousSentenceAsync();
-                }
-                else
-                {
-                    await mpv.NextSentenceAsync();
-                }
+                await PlaySentenceAtCurrentIndexAsync();
             }
             catch (Exception ex)
             {
@@ -726,9 +730,9 @@ namespace ShadowingPlayer
             }
         }
 
-        private async Task AdjustSentenceBoundaryAsync(bool adjustStart, int direction)
+        private Task AdjustSentenceBoundaryAsync(bool adjustStart, int direction)
         {
-            try
+            return RunSegmentEditAsync(async delegate
             {
                 if (mpv == null || transcriptSegments.Count == 0)
                 {
@@ -738,15 +742,16 @@ namespace ShadowingPlayer
 
                 await PauseForBoundaryAdjustmentAsync();
 
-                if (currentSentenceIndex < 0)
+                var targetIndex = ClampSentenceIndex(currentSentenceIndex < 0 ? 0 : currentSentenceIndex);
+                if (targetIndex < 0)
                 {
-                    currentSentenceIndex = 0;
+                    return;
                 }
 
-                currentSentenceIndex = Math.Max(0, Math.Min(transcriptSegments.Count - 1, currentSentenceIndex));
+                currentSentenceIndex = targetIndex;
                 var changed = adjustStart
-                    ? AdjustSentenceStart(currentSentenceIndex, direction)
-                    : AdjustSentenceEnd(currentSentenceIndex, direction);
+                    ? AdjustSentenceStart(targetIndex, direction)
+                    : AdjustSentenceEnd(targetIndex, direction);
 
                 if (!changed)
                 {
@@ -764,24 +769,21 @@ namespace ShadowingPlayer
                 SelectCurrentSentenceText();
 
                 await LoadSentenceSegmentsIntoPlayerAsync();
+                await RefreshLoadedSubtitlesAsync();
                 UpdateWaveformSentences();
                 if (sentenceModeEnabled)
                 {
-                    await mpv.PlaySentenceAsync(currentSentenceIndex + 1);
+                    await PlaySentenceAtCurrentIndexAsync();
                 }
 
                 var boundary = adjustStart
-                    ? transcriptSegments[currentSentenceIndex].Start
-                    : GetEffectiveSentenceEnd(currentSentenceIndex);
+                    ? transcriptSegments[targetIndex].Start
+                    : GetEffectiveSentenceEnd(targetIndex);
                 statusLabel.Text =
-                    "Sentence " + (currentSentenceIndex + 1) + " " +
+                    "Sentence " + (targetIndex + 1) + " " +
                     (adjustStart ? "start" : "end") + " " +
                     FormatDisplayTime(boundary);
-            }
-            catch (Exception ex)
-            {
-                statusLabel.Text = ex.Message;
-            }
+            });
         }
 
         private bool AdjustSentenceStart(int sentenceIndex, int direction)
@@ -842,9 +844,9 @@ namespace ShadowingPlayer
             return true;
         }
 
-        private async Task SetSentenceBoundaryFromWaveformAsync(bool adjustStart, TimeSpan boundary)
+        private Task SetSentenceBoundaryFromWaveformAsync(bool adjustStart, TimeSpan boundary)
         {
-            try
+            return RunSegmentEditAsync(async delegate
             {
                 if (mpv == null || transcriptSegments.Count == 0)
                 {
@@ -853,10 +855,16 @@ namespace ShadowingPlayer
 
                 await PauseForBoundaryAdjustmentAsync();
 
-                currentSentenceIndex = Math.Max(0, Math.Min(transcriptSegments.Count - 1, currentSentenceIndex));
+                var targetIndex = ClampSentenceIndex(currentSentenceIndex);
+                if (targetIndex < 0)
+                {
+                    return;
+                }
+
+                currentSentenceIndex = targetIndex;
                 var changed = adjustStart
-                    ? SetSentenceStart(currentSentenceIndex, boundary)
-                    : SetSentenceEnd(currentSentenceIndex, boundary);
+                    ? SetSentenceStart(targetIndex, boundary)
+                    : SetSentenceEnd(targetIndex, boundary);
 
                 if (!changed)
                 {
@@ -874,19 +882,215 @@ namespace ShadowingPlayer
                 transcriptBox.Text = BuildTranscriptText("Adjusted transcript timing.", transcriptSegments);
                 SelectCurrentSentenceText();
                 await LoadSentenceSegmentsIntoPlayerAsync();
+                await RefreshLoadedSubtitlesAsync();
                 UpdateWaveformSentences();
 
                 if (sentenceModeEnabled)
                 {
-                    await mpv.PlaySentenceAsync(currentSentenceIndex + 1);
+                    await PlaySentenceAtCurrentIndexAsync();
                 }
 
-                statusLabel.Text = "Sentence " + (currentSentenceIndex + 1) + " boundary " + FormatDisplayTime(boundary);
+                statusLabel.Text = "Sentence " + (targetIndex + 1) + " boundary " + FormatDisplayTime(boundary);
+            });
+        }
+
+        private Task AddStopPointFromWaveformAsync(TimeSpan boundary)
+        {
+            return RunSegmentEditAsync(async delegate
+            {
+                if (mpv == null || transcriptSegments.Count == 0)
+                {
+                    return;
+                }
+
+                await PauseForBoundaryAdjustmentAsync();
+
+                var targetIndex = ClampSentenceIndex(currentSentenceIndex);
+                if (targetIndex < 0)
+                {
+                    return;
+                }
+
+                TimeSpan splitAt;
+                if (!SplitSentenceAt(targetIndex, boundary, out splitAt))
+                {
+                    statusLabel.Text = "Stop point cannot be added there.";
+                    return;
+                }
+
+                // Stay on the first half (the segment that now ends at the new stop
+                // point) so the result is deterministic; the user can step to the
+                // second half with Next. The playhead is repositioned to match in
+                // CommitTranscriptStructureChangeAsync.
+                currentSentenceIndex = targetIndex;
+                await CommitTranscriptStructureChangeAsync("Added stop point.");
+            });
+        }
+
+        private Task DeleteStopPointFromWaveformAsync(bool deleteStartBoundary)
+        {
+            return RunSegmentEditAsync(async delegate
+            {
+                if (mpv == null || transcriptSegments.Count == 0)
+                {
+                    return;
+                }
+
+                await PauseForBoundaryAdjustmentAsync();
+
+                if (ClampSentenceIndex(currentSentenceIndex) < 0)
+                {
+                    return;
+                }
+
+                currentSentenceIndex = ClampSentenceIndex(currentSentenceIndex);
+                if (!MergeSentenceAcrossBoundary(deleteStartBoundary))
+                {
+                    statusLabel.Text = "Stop point cannot be deleted there.";
+                    return;
+                }
+
+                ClampCurrentSentenceIndex();
+                await CommitTranscriptStructureChangeAsync("Deleted stop point.");
+            });
+        }
+
+        // Runs a transcript-structure/timing edit with mutual exclusion against other
+        // edits and against the waveform playback timer. Any new waveform edit feature
+        // should call through here so it inherits the same re-entrancy protection.
+        private async Task RunSegmentEditAsync(Func<Task> edit)
+        {
+            if (waveformEditInProgress)
+            {
+                return;
+            }
+
+            waveformEditInProgress = true;
+            try
+            {
+                await edit();
             }
             catch (Exception ex)
             {
                 statusLabel.Text = ex.Message;
             }
+            finally
+            {
+                waveformEditInProgress = false;
+            }
+        }
+
+        private int ClampSentenceIndex(int index)
+        {
+            if (transcriptSegments.Count == 0)
+            {
+                return -1;
+            }
+
+            return Math.Max(0, Math.Min(transcriptSegments.Count - 1, index));
+        }
+
+        private bool SplitSentenceAt(int index, TimeSpan boundary, out TimeSpan splitAt)
+        {
+            splitAt = TimeSpan.Zero;
+            var segment = transcriptSegments[index];
+            var minimumGap = TimeSpan.FromMilliseconds(MinimumSentenceDurationMilliseconds);
+            var end = GetEffectiveSentenceEnd(index);
+            var minimum = segment.Start + minimumGap;
+            var maximum = end - minimumGap;
+
+            if (maximum <= minimum || boundary <= minimum || boundary >= maximum)
+            {
+                return false;
+            }
+
+            splitAt = Clamp(boundary, minimum, maximum);
+            segment.SetEnd(splitAt);
+            transcriptSegments.Insert(
+                index + 1,
+                new TranscriptSegment(splitAt, end, segment.Text));
+            return true;
+        }
+
+        private bool MergeSentenceAcrossBoundary(bool deleteStartBoundary)
+        {
+            if (deleteStartBoundary)
+            {
+                if (currentSentenceIndex <= 0)
+                {
+                    return false;
+                }
+
+                MergeSegments(currentSentenceIndex - 1, currentSentenceIndex);
+                currentSentenceIndex--;
+                return true;
+            }
+
+            if (currentSentenceIndex + 1 >= transcriptSegments.Count)
+            {
+                return false;
+            }
+
+            MergeSegments(currentSentenceIndex, currentSentenceIndex + 1);
+            return true;
+        }
+
+        private void MergeSegments(int firstIndex, int secondIndex)
+        {
+            var first = transcriptSegments[firstIndex];
+            var second = transcriptSegments[secondIndex];
+            first.SetEnd(second.End);
+            first.SetText(CombineSegmentText(first.Text, second.Text));
+            transcriptSegments.RemoveAt(secondIndex);
+        }
+
+        private async Task CommitTranscriptStructureChangeAsync(string message)
+        {
+            ClampCurrentSentenceIndex();
+
+            if (!string.IsNullOrWhiteSpace(currentTranscriptPath))
+            {
+                WriteSrtFile(currentTranscriptPath, transcriptSegments);
+            }
+
+            if (!string.IsNullOrWhiteSpace(currentVideoPath))
+            {
+                SaveUserEditedMasterTranscript(currentVideoPath, currentTranscriptModel, transcriptSegments);
+                SyncMasterTranscriptTimings(currentVideoPath);
+            }
+
+            transcriptBox.Text = BuildTranscriptText(message, transcriptSegments);
+            SelectCurrentSentenceText();
+            await LoadSentenceSegmentsIntoPlayerAsync();
+            await RefreshLoadedSubtitlesAsync();
+            UpdateWaveformSentences();
+
+            if (sentenceModeEnabled && currentSentenceIndex >= 0)
+            {
+                await PlaySentenceAtCurrentIndexAsync();
+            }
+            else if (currentSentenceIndex >= 0 && currentSentenceIndex < transcriptSegments.Count)
+            {
+                // Park the playhead at the start of the resulting sentence so the
+                // playback timer keeps it current instead of snapping the index back
+                // to wherever playback happened to be paused.
+                var sentenceStart = transcriptSegments[currentSentenceIndex].Start;
+                await mpv.SeekAbsoluteAsync(sentenceStart.TotalSeconds);
+                waveformPanel.SetPlaybackPosition(
+                    GetWaveformDisplayPosition(sentenceStart).TotalSeconds,
+                    currentSentenceIndex);
+            }
+
+            statusLabel.Text = currentSentenceIndex >= 0
+                ? message + " Sentence " + (currentSentenceIndex + 1) + " / " + transcriptSegments.Count
+                : message;
+        }
+
+        private void ClampCurrentSentenceIndex()
+        {
+            currentSentenceIndex = transcriptSegments.Count == 0
+                ? -1
+                : Math.Max(0, Math.Min(transcriptSegments.Count - 1, currentSentenceIndex));
         }
 
         private async Task SeekFromWaveformAsync(TimeSpan position)
@@ -920,19 +1124,16 @@ namespace ShadowingPlayer
                     return;
                 }
 
-                if (sentenceModeEnabled)
-                {
-                    await mpv.RepeatSentenceAsync();
-                    return;
-                }
-
                 if (currentSentenceIndex < 0)
                 {
                     currentSentenceIndex = 0;
                 }
 
                 currentSentenceIndex = Math.Max(0, Math.Min(transcriptSegments.Count - 1, currentSentenceIndex));
-                await mpv.PlaySentenceAsync(currentSentenceIndex + 1);
+
+                // Always drive mpv by C#'s index (absolute) rather than the Lua script's
+                // own relative counter, so the two can never drift after an edit.
+                await PlaySentenceAtCurrentIndexAsync();
                 UpdateCurrentSentenceStatus();
             }
             catch (Exception ex)
@@ -961,6 +1162,21 @@ namespace ShadowingPlayer
             }
 
             await mpv.EnableSentenceModeAsync();
+        }
+
+        private async Task PlaySentenceAtCurrentIndexAsync()
+        {
+            if (mpv == null || transcriptSegments.Count == 0)
+            {
+                return;
+            }
+
+            currentSentenceIndex = Math.Max(0, Math.Min(transcriptSegments.Count - 1, currentSentenceIndex));
+            var segment = transcriptSegments[currentSentenceIndex];
+            await mpv.SeekAbsoluteAsync(segment.Start.TotalSeconds);
+            await Task.Delay(80);
+            await mpv.EnableSentenceModeAsync();
+            await mpv.SetPauseAsync(false);
         }
 
         private async Task LoadSentenceSegmentsIntoPlayerAsync()
@@ -1038,7 +1254,7 @@ namespace ShadowingPlayer
 
         private async Task UpdateWaveformPlaybackAsync()
         {
-            if (!waveformVisible || waveformTimerBusy || mpv == null)
+            if (!waveformVisible || waveformTimerBusy || waveformEditInProgress || mpv == null)
             {
                 return;
             }
@@ -1061,7 +1277,7 @@ namespace ShadowingPlayer
                     }
                     else
                     {
-                        var sentenceIndex = FindSentenceIndexAt(playbackPosition);
+                        var sentenceIndex = ResolveCurrentSentenceForPlayback(playbackPosition);
                         if (sentenceIndex != currentSentenceIndex)
                         {
                             currentSentenceIndex = sentenceIndex;
@@ -1105,6 +1321,41 @@ namespace ShadowingPlayer
             }
 
             waveformPanel.SetSentences(items, currentSentenceIndex);
+        }
+
+        // Picks the highlighted sentence from a playback position while keeping the
+        // current sentence "sticky": once a position is inside the current sentence it
+        // stays current until the playhead clearly leaves it. Without this, a single
+        // sentence that finishes playing pauses a few ms past its end (which equals the
+        // next sentence's start) and the highlight would jump one sentence forward.
+        private int ResolveCurrentSentenceForPlayback(TimeSpan playbackPosition)
+        {
+            if (currentSentenceIndex >= 0 && currentSentenceIndex < transcriptSegments.Count)
+            {
+                var start = transcriptSegments[currentSentenceIndex].Start;
+                var end = GetEffectiveSentenceEnd(currentSentenceIndex);
+
+                // Grace past the end covers the Lua finish overshoot. Cap it at half the
+                // next sentence so a very short following sentence is never swallowed.
+                var grace = TimeSpan.FromMilliseconds(120);
+                if (currentSentenceIndex + 1 < transcriptSegments.Count)
+                {
+                    var next = transcriptSegments[currentSentenceIndex + 1];
+                    var nextHalf = TimeSpan.FromTicks(
+                        (GetEffectiveSentenceEnd(currentSentenceIndex + 1) - next.Start).Ticks / 2);
+                    if (nextHalf < grace)
+                    {
+                        grace = nextHalf;
+                    }
+                }
+
+                if (playbackPosition >= start && playbackPosition <= end + grace)
+                {
+                    return currentSentenceIndex;
+                }
+            }
+
+            return FindSentenceIndexAt(playbackPosition);
         }
 
         private int FindSentenceIndexAt(TimeSpan playbackPosition)
@@ -1333,6 +1584,26 @@ namespace ShadowingPlayer
             }
 
             return string.Empty;
+        }
+
+        // After an edit rewrites the transcript SRT, force mpv to re-read it so the
+        // subtitle overlaid on the video reflects the new sentence boundaries.
+        private async Task RefreshLoadedSubtitlesAsync()
+        {
+            if (mpv == null || string.IsNullOrWhiteSpace(currentTranscriptPath))
+            {
+                return;
+            }
+
+            try
+            {
+                await mpv.ReloadSubtitleAsync();
+                await mpv.SetSubtitleVisibilityAsync(subtitlesVisible);
+            }
+            catch (Exception ex)
+            {
+                statusLabel.Text = ex.Message;
+            }
         }
 
         private async Task PauseForBoundaryAdjustmentAsync()
@@ -1801,6 +2072,11 @@ namespace ShadowingPlayer
                 return currentText;
             }
 
+            if (TokenSequencesEqual(previousTokens, currentTokens))
+            {
+                return currentText;
+            }
+
             const int minimumOverlapWords = 4;
             var maxOverlap = Math.Min(previousTokens.Count, currentTokens.Count - 1);
             for (var overlap = maxOverlap; overlap >= minimumOverlapWords; overlap--)
@@ -1826,6 +2102,49 @@ namespace ShadowingPlayer
             }
 
             return currentText;
+        }
+
+        private static string CombineSegmentText(string firstText, string secondText)
+        {
+            if (string.IsNullOrWhiteSpace(firstText))
+            {
+                return secondText ?? string.Empty;
+            }
+
+            if (string.IsNullOrWhiteSpace(secondText))
+            {
+                return firstText;
+            }
+
+            var firstTokens = GetOverlapTokens(firstText);
+            var secondTokens = GetOverlapTokens(secondText);
+            if (TokenSequencesEqual(firstTokens, secondTokens))
+            {
+                return firstText;
+            }
+
+            var trimmedSecond = RemoveRepeatedPrefixFromCurrentSegment(firstText, secondText);
+            return string.IsNullOrWhiteSpace(trimmedSecond)
+                ? firstText
+                : firstText.TrimEnd() + " " + trimmedSecond.TrimStart();
+        }
+
+        private static bool TokenSequencesEqual(List<OverlapToken> first, List<OverlapToken> second)
+        {
+            if (first.Count != second.Count)
+            {
+                return false;
+            }
+
+            for (var i = 0; i < first.Count; i++)
+            {
+                if (!string.Equals(first[i].Normalized, second[i].Normalized, StringComparison.Ordinal))
+                {
+                    return false;
+                }
+            }
+
+            return true;
         }
 
         private static List<OverlapToken> GetOverlapTokens(string text)
