@@ -30,6 +30,7 @@ namespace ShadowingPlayer
         private readonly Button previousSentenceButton = new Button();
         private readonly Button nextSentenceButton = new Button();
         private readonly Button repeatSentenceButton = new Button();
+        private readonly Button waveformButton = new Button();
         private readonly Button sentenceStartEarlierButton = new Button();
         private readonly Button sentenceStartLaterButton = new Button();
         private readonly Button sentenceEndEarlierButton = new Button();
@@ -38,13 +39,20 @@ namespace ShadowingPlayer
         private readonly ComboBox whisperModelCombo = new ComboBox();
         private readonly NumericUpDown timingStepInput = new NumericUpDown();
         private readonly Label statusLabel = new Label();
+        private readonly Panel playerPanel = new Panel();
         private readonly RichTextBox transcriptBox = new RichTextBox();
+        private readonly WaveformPanel waveformPanel = new WaveformPanel();
+        private readonly Timer waveformTimer = new Timer();
         private readonly List<TranscriptSegment> transcriptSegments = new List<TranscriptSegment>();
         private MpvController mpv;
         private string currentVideoPath;
         private string currentTranscriptPath;
+        private float[] waveformPeaks = new float[0];
+        private double waveformDurationSeconds;
         private bool subtitlesVisible = true;
         private bool sentenceModeEnabled;
+        private bool waveformVisible;
+        private bool waveformTimerBusy;
         private int currentSentenceIndex = -1;
 
         public MainForm()
@@ -127,6 +135,11 @@ namespace ShadowingPlayer
             repeatSentenceButton.Enabled = false;
             repeatSentenceButton.Click += async delegate { await PlayCurrentSentenceAsync(); };
 
+            waveformButton.Text = "Waveform: Off";
+            waveformButton.Width = 116;
+            waveformButton.Enabled = false;
+            waveformButton.Click += async delegate { await ToggleWaveformAsync(); };
+
             nextSentenceButton.Text = "Next sentence";
             nextSentenceButton.Width = 112;
             nextSentenceButton.Enabled = false;
@@ -185,6 +198,7 @@ namespace ShadowingPlayer
             toolbar.Controls.Add(previousSentenceButton);
             toolbar.Controls.Add(repeatSentenceButton);
             toolbar.Controls.Add(nextSentenceButton);
+            toolbar.Controls.Add(waveformButton);
             toolbar.Controls.Add(sentenceStartEarlierButton);
             toolbar.Controls.Add(sentenceStartLaterButton);
             toolbar.Controls.Add(sentenceEndEarlierButton);
@@ -198,6 +212,24 @@ namespace ShadowingPlayer
             videoHost.Dock = DockStyle.Fill;
             videoHost.BackColor = Color.Black;
 
+            waveformPanel.Dock = DockStyle.Bottom;
+            waveformPanel.Visible = false;
+            waveformPanel.BoundaryChanged += async delegate(object sender, WaveformBoundaryChangedEventArgs args)
+            {
+                await SetSentenceBoundaryFromWaveformAsync(args.IsStartBoundary, TimeSpan.FromSeconds(args.Seconds));
+            };
+            waveformPanel.SeekRequested += async delegate(object sender, WaveformSeekEventArgs args)
+            {
+                await SeekFromWaveformAsync(TimeSpan.FromSeconds(args.Seconds));
+            };
+
+            waveformTimer.Interval = 150;
+            waveformTimer.Tick += async delegate { await UpdateWaveformPlaybackAsync(); };
+
+            playerPanel.Dock = DockStyle.Fill;
+            playerPanel.Controls.Add(videoHost);
+            playerPanel.Controls.Add(waveformPanel);
+
             transcriptBox.Dock = DockStyle.Right;
             transcriptBox.Width = 360;
             transcriptBox.Multiline = true;
@@ -209,7 +241,7 @@ namespace ShadowingPlayer
             transcriptBox.DetectUrls = false;
             transcriptBox.Text = "Transcript will appear here.";
 
-            Controls.Add(videoHost);
+            Controls.Add(playerPanel);
             Controls.Add(transcriptBox);
             Controls.Add(toolbar);
             FormClosing += async delegate { await ShutdownAsync(); };
@@ -285,6 +317,10 @@ namespace ShadowingPlayer
 
                     currentVideoPath = dialog.FileName;
                     currentTranscriptPath = null;
+                    waveformPeaks = new float[0];
+                    waveformDurationSeconds = 0;
+                    waveformPanel.SetWaveform(waveformPeaks, waveformDurationSeconds);
+                    waveformPanel.SetMessage("Waveform not loaded.");
                     transcriptSegments.Clear();
                     currentSentenceIndex = -1;
                     subtitlesVisible = true;
@@ -393,6 +429,7 @@ namespace ShadowingPlayer
             subtitlesButton.Text = "Subtitles: On";
             await mpv.SetSubtitleVisibilityAsync(true);
             await LoadSentenceSegmentsIntoPlayerAsync();
+            UpdateWaveformSentences();
             UpdateSentenceModeButtons();
             SelectCurrentSentenceText();
             statusLabel.Text = message + " " + transcriptSegments.Count + " sentences.";
@@ -448,6 +485,66 @@ namespace ShadowingPlayer
             {
                 sentenceModeEnabled = false;
                 UpdateSentenceModeButtons();
+                statusLabel.Text = ex.Message;
+            }
+        }
+
+        private async Task ToggleWaveformAsync()
+        {
+            if (string.IsNullOrWhiteSpace(currentVideoPath))
+            {
+                statusLabel.Text = "Open a video first.";
+                return;
+            }
+
+            waveformVisible = !waveformVisible;
+            waveformPanel.Visible = waveformVisible;
+            waveformButton.Text = waveformVisible ? "Waveform: On" : "Waveform: Off";
+
+            if (!waveformVisible)
+            {
+                waveformTimer.Stop();
+                return;
+            }
+
+            await EnsureWaveformLoadedAsync();
+            UpdateWaveformSentences();
+            waveformTimer.Start();
+            await UpdateWaveformPlaybackAsync();
+        }
+
+        private async Task EnsureWaveformLoadedAsync()
+        {
+            if (waveformPeaks.Length > 0 && waveformDurationSeconds > 0)
+            {
+                return;
+            }
+
+            var cachePath = GetWaveformCachePath(currentVideoPath);
+            try
+            {
+                if (File.Exists(cachePath) && TryLoadWaveformCache(cachePath, out waveformPeaks, out waveformDurationSeconds))
+                {
+                    waveformPanel.SetWaveform(waveformPeaks, waveformDurationSeconds);
+                    statusLabel.Text = "Loaded cached waveform.";
+                    return;
+                }
+
+                waveformPanel.SetMessage("Generating waveform...");
+                statusLabel.Text = "Generating waveform...";
+
+                var result = await Task.Run(new Func<WaveformData>(() => GenerateWaveform(currentVideoPath)));
+                waveformPeaks = result.Peaks;
+                waveformDurationSeconds = result.DurationSeconds;
+                SaveWaveformCache(cachePath, waveformPeaks, waveformDurationSeconds);
+                waveformPanel.SetWaveform(waveformPeaks, waveformDurationSeconds);
+                statusLabel.Text = "Waveform ready.";
+            }
+            catch (Exception ex)
+            {
+                waveformPeaks = new float[0];
+                waveformDurationSeconds = 0;
+                waveformPanel.SetMessage(ex.Message);
                 statusLabel.Text = ex.Message;
             }
         }
@@ -526,6 +623,7 @@ namespace ShadowingPlayer
                 SelectCurrentSentenceText();
 
                 await LoadSentenceSegmentsIntoPlayerAsync();
+                UpdateWaveformSentences();
                 if (sentenceModeEnabled)
                 {
                     await mpv.PlaySentenceAsync(currentSentenceIndex + 1);
@@ -547,14 +645,23 @@ namespace ShadowingPlayer
 
         private bool AdjustSentenceStart(int sentenceIndex, int direction)
         {
+            return SetSentenceStart(sentenceIndex, AddStep(transcriptSegments[sentenceIndex].Start, direction));
+        }
+
+        private bool AdjustSentenceEnd(int sentenceIndex, int direction)
+        {
+            return SetSentenceEnd(sentenceIndex, AddStep(GetEffectiveSentenceEnd(sentenceIndex), direction));
+        }
+
+        private bool SetSentenceStart(int sentenceIndex, TimeSpan requested)
+        {
             var segment = transcriptSegments[sentenceIndex];
             var minimumGap = TimeSpan.FromMilliseconds(MinimumSentenceDurationMilliseconds);
-            var proposed = AddStep(segment.Start, direction);
             var minimum = sentenceIndex > 0
                 ? transcriptSegments[sentenceIndex - 1].Start + minimumGap
                 : TimeSpan.Zero;
             var maximum = segment.End - minimumGap;
-            var adjusted = Clamp(proposed, minimum, maximum);
+            var adjusted = Clamp(requested, minimum, maximum);
 
             if (adjusted == segment.Start)
             {
@@ -570,16 +677,15 @@ namespace ShadowingPlayer
             return true;
         }
 
-        private bool AdjustSentenceEnd(int sentenceIndex, int direction)
+        private bool SetSentenceEnd(int sentenceIndex, TimeSpan requested)
         {
             var segment = transcriptSegments[sentenceIndex];
             var minimumGap = TimeSpan.FromMilliseconds(MinimumSentenceDurationMilliseconds);
-            var proposed = AddStep(GetEffectiveSentenceEnd(sentenceIndex), direction);
             var minimum = segment.Start + minimumGap;
             var maximum = sentenceIndex + 1 < transcriptSegments.Count
                 ? transcriptSegments[sentenceIndex + 1].End - minimumGap
                 : TimeSpan.MaxValue;
-            var adjusted = Clamp(proposed, minimum, maximum);
+            var adjusted = Clamp(requested, minimum, maximum);
 
             if (adjusted == GetEffectiveSentenceEnd(sentenceIndex))
             {
@@ -593,6 +699,71 @@ namespace ShadowingPlayer
             }
 
             return true;
+        }
+
+        private async Task SetSentenceBoundaryFromWaveformAsync(bool adjustStart, TimeSpan boundary)
+        {
+            try
+            {
+                if (mpv == null || transcriptSegments.Count == 0)
+                {
+                    return;
+                }
+
+                currentSentenceIndex = Math.Max(0, Math.Min(transcriptSegments.Count - 1, currentSentenceIndex));
+                var changed = adjustStart
+                    ? SetSentenceStart(currentSentenceIndex, boundary)
+                    : SetSentenceEnd(currentSentenceIndex, boundary);
+
+                if (!changed)
+                {
+                    statusLabel.Text = "Sentence boundary cannot move further.";
+                    UpdateWaveformSentences();
+                    return;
+                }
+
+                if (!string.IsNullOrWhiteSpace(currentTranscriptPath))
+                {
+                    WriteSrtFile(currentTranscriptPath, transcriptSegments);
+                }
+
+                transcriptBox.Text = BuildTranscriptText("Adjusted transcript timing.", transcriptSegments);
+                SelectCurrentSentenceText();
+                await LoadSentenceSegmentsIntoPlayerAsync();
+                UpdateWaveformSentences();
+
+                if (sentenceModeEnabled)
+                {
+                    await mpv.PlaySentenceAsync(currentSentenceIndex + 1);
+                }
+
+                statusLabel.Text = "Sentence " + (currentSentenceIndex + 1) + " boundary " + FormatDisplayTime(boundary);
+            }
+            catch (Exception ex)
+            {
+                statusLabel.Text = ex.Message;
+            }
+        }
+
+        private async Task SeekFromWaveformAsync(TimeSpan position)
+        {
+            if (mpv == null)
+            {
+                return;
+            }
+
+            try
+            {
+                await mpv.SeekAbsoluteAsync(position.TotalSeconds);
+                currentSentenceIndex = FindSentenceIndexAt(position);
+                UpdateCurrentSentenceStatus();
+                UpdateWaveformSentences();
+                waveformPanel.SetPlaybackPosition(position.TotalSeconds, currentSentenceIndex);
+            }
+            catch (Exception ex)
+            {
+                statusLabel.Text = ex.Message;
+            }
         }
 
         private async Task PlayCurrentSentenceAsync()
@@ -674,7 +845,57 @@ namespace ShadowingPlayer
         {
             currentSentenceIndex = Math.Max(0, Math.Min(transcriptSegments.Count - 1, currentSentenceIndex));
             SelectCurrentSentenceText();
+            UpdateWaveformSentences();
             statusLabel.Text = "Sentence " + (currentSentenceIndex + 1) + " / " + transcriptSegments.Count;
+        }
+
+        private async Task UpdateWaveformPlaybackAsync()
+        {
+            if (!waveformVisible || waveformTimerBusy || mpv == null)
+            {
+                return;
+            }
+
+            waveformTimerBusy = true;
+            try
+            {
+                var timePosition = await mpv.GetTimePositionAsync();
+                if (!timePosition.HasValue)
+                {
+                    return;
+                }
+
+                var playbackPosition = TimeSpan.FromSeconds(timePosition.Value);
+                if (transcriptSegments.Count > 0)
+                {
+                    var sentenceIndex = FindSentenceIndexAt(playbackPosition);
+                    if (sentenceIndex != currentSentenceIndex)
+                    {
+                        currentSentenceIndex = sentenceIndex;
+                        SelectCurrentSentenceText();
+                    }
+                }
+
+                waveformPanel.SetPlaybackPosition(timePosition.Value, currentSentenceIndex);
+                UpdateWaveformSentences();
+            }
+            finally
+            {
+                waveformTimerBusy = false;
+            }
+        }
+
+        private void UpdateWaveformSentences()
+        {
+            var items = new List<WaveformSentence>();
+            for (var i = 0; i < transcriptSegments.Count; i++)
+            {
+                items.Add(new WaveformSentence(
+                    transcriptSegments[i].Start.TotalSeconds,
+                    GetEffectiveSentenceEnd(i).TotalSeconds));
+            }
+
+            waveformPanel.SetSentences(items, currentSentenceIndex);
         }
 
         private int FindSentenceIndexAt(TimeSpan playbackPosition)
@@ -760,6 +981,7 @@ namespace ShadowingPlayer
         {
             var hasSentences = transcriptSegments.Count > 0;
             sentenceModeButton.Enabled = hasSentences;
+            waveformButton.Enabled = !string.IsNullOrWhiteSpace(currentVideoPath);
             previousSentenceButton.Enabled = hasSentences && sentenceModeEnabled;
             repeatSentenceButton.Enabled = hasSentences && sentenceModeEnabled;
             nextSentenceButton.Enabled = hasSentences && sentenceModeEnabled;
@@ -894,6 +1116,162 @@ namespace ShadowingPlayer
             var safeModelName = string.IsNullOrWhiteSpace(modelName) ? "small" : modelName.Replace('/', '-').Replace('\\', '-');
             var fileName = Path.GetFileNameWithoutExtension(videoPath) + ".shadowing." + safeModelName + ".srt";
             return string.IsNullOrEmpty(directory) ? fileName : Path.Combine(directory, fileName);
+        }
+
+        private static string GetWaveformCachePath(string videoPath)
+        {
+            var directory = Path.GetDirectoryName(videoPath);
+            var fileName = Path.GetFileNameWithoutExtension(videoPath) + ".shadowing.waveform.txt";
+            return string.IsNullOrEmpty(directory) ? fileName : Path.Combine(directory, fileName);
+        }
+
+        private static string ResolveFfmpegPath()
+        {
+            var ffmpegPath = Environment.GetEnvironmentVariable("SHADOWING_FFMPEG_PATH");
+            if (!string.IsNullOrWhiteSpace(ffmpegPath))
+            {
+                return ffmpegPath;
+            }
+
+            var bundledPath = @"E:\tools\ffmpeg-2026-06-15-git-44d082edc8-essentials_build\bin\ffmpeg.exe";
+            return File.Exists(bundledPath) ? bundledPath : "ffmpeg.exe";
+        }
+
+        private static WaveformData GenerateWaveform(string mediaPath)
+        {
+            const int sampleRate = 8000;
+            const int samplesPerPeak = 400;
+            var peaks = new List<float>();
+            var maxSample = 0;
+            var samplesInPeak = 0;
+            long totalSamples = 0;
+
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = ResolveFfmpegPath(),
+                Arguments =
+                    "-hide_banner -loglevel error " +
+                    "-i " + QuoteArgument(mediaPath) + " " +
+                    "-vn -ac 1 -ar " + sampleRate.ToString(CultureInfo.InvariantCulture) + " " +
+                    "-f s16le pipe:1",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+
+            try
+            {
+                using (var process = new Process { StartInfo = startInfo })
+                {
+                    if (!process.Start())
+                    {
+                        throw new InvalidOperationException("Could not start ffmpeg.");
+                    }
+
+                    var errorTask = process.StandardError.ReadToEndAsync();
+                    var buffer = new byte[32768];
+                    var stream = process.StandardOutput.BaseStream;
+                    int bytesRead;
+                    while ((bytesRead = stream.Read(buffer, 0, buffer.Length)) > 0)
+                    {
+                        for (var offset = 0; offset + 1 < bytesRead; offset += 2)
+                        {
+                            var sample = (short)(buffer[offset] | (buffer[offset + 1] << 8));
+                            var absolute = Math.Abs((int)sample);
+                            if (absolute > maxSample)
+                            {
+                                maxSample = absolute;
+                            }
+
+                            samplesInPeak++;
+                            totalSamples++;
+                            if (samplesInPeak >= samplesPerPeak)
+                            {
+                                peaks.Add(Math.Min(1f, maxSample / 32768f));
+                                maxSample = 0;
+                                samplesInPeak = 0;
+                            }
+                        }
+                    }
+
+                    if (samplesInPeak > 0)
+                    {
+                        peaks.Add(Math.Min(1f, maxSample / 32768f));
+                    }
+
+                    process.WaitForExit();
+                    var error = errorTask.Result;
+                    if (process.ExitCode != 0)
+                    {
+                        throw new InvalidOperationException(
+                            string.IsNullOrWhiteSpace(error) ? "ffmpeg could not generate waveform data." : error.Trim());
+                    }
+                }
+            }
+            catch (System.ComponentModel.Win32Exception ex)
+            {
+                throw new InvalidOperationException(
+                    "ffmpeg.exe was not found. Install ffmpeg, add it to PATH, or set SHADOWING_FFMPEG_PATH.",
+                    ex);
+            }
+
+            if (peaks.Count == 0 || totalSamples == 0)
+            {
+                throw new InvalidOperationException("No audio waveform could be generated for this video.");
+            }
+
+            return new WaveformData(peaks.ToArray(), totalSamples / (double)sampleRate);
+        }
+
+        private static bool TryLoadWaveformCache(string path, out float[] peaks, out double durationSeconds)
+        {
+            peaks = new float[0];
+            durationSeconds = 0;
+
+            try
+            {
+                var lines = File.ReadAllLines(path, Encoding.UTF8);
+                if (lines.Length < 3 || lines[0] != "SHADOWING_WAVEFORM_V1")
+                {
+                    return false;
+                }
+
+                if (!double.TryParse(lines[1], NumberStyles.Float, CultureInfo.InvariantCulture, out durationSeconds))
+                {
+                    return false;
+                }
+
+                var values = new List<float>();
+                for (var i = 2; i < lines.Length; i++)
+                {
+                    float value;
+                    if (float.TryParse(lines[i], NumberStyles.Float, CultureInfo.InvariantCulture, out value))
+                    {
+                        values.Add(Math.Max(0, Math.Min(1, value)));
+                    }
+                }
+
+                peaks = values.ToArray();
+                return peaks.Length > 0 && durationSeconds > 0;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static void SaveWaveformCache(string path, float[] peaks, double durationSeconds)
+        {
+            using (var writer = new StreamWriter(path, false, Encoding.UTF8))
+            {
+                writer.WriteLine("SHADOWING_WAVEFORM_V1");
+                writer.WriteLine(durationSeconds.ToString("R", CultureInfo.InvariantCulture));
+                for (var i = 0; i < peaks.Length; i++)
+                {
+                    writer.WriteLine(peaks[i].ToString("R", CultureInfo.InvariantCulture));
+                }
+            }
         }
 
         private static string BuildTranscriptText(string header, List<TranscriptSegment> segments)
@@ -1089,6 +1467,7 @@ namespace ShadowingPlayer
         {
             try
             {
+                waveformTimer.Stop();
                 if (mpv != null)
                 {
                     await mpv.DisableSentenceModeAsync();
@@ -1100,6 +1479,19 @@ namespace ShadowingPlayer
             {
                 mpv = null;
             }
+        }
+
+        private sealed class WaveformData
+        {
+            public WaveformData(float[] peaks, double durationSeconds)
+            {
+                Peaks = peaks;
+                DurationSeconds = durationSeconds;
+            }
+
+            public float[] Peaks { get; private set; }
+
+            public double DurationSeconds { get; private set; }
         }
 
         private sealed class TranscriptSegment

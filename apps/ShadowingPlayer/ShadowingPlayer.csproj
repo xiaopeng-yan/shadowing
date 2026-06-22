@@ -45,6 +45,7 @@
     <Compile Include="MpvController.cs" />
     <Compile Include="Program.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
+    <Compile Include="WaveformPanel.cs" />
   </ItemGroup>
   <ItemGroup>
     <Content Include="shadowing_sentence_mode.lua">
