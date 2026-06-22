@@ -1,3 +1,7 @@
 /subprojects/*
 !/subprojects/packagefiles
 !/subprojects/*.wrap
+.vs/
+apps/ShadowingPlayer/.venv/
+apps/ShadowingPlayer/bin/
+apps/ShadowingPlayer/obj/
