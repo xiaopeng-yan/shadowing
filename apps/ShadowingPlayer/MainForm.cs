@@ -5,6 +5,7 @@ using System.Drawing;
 using System.Globalization;
 using System.IO;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
@@ -37,8 +38,10 @@ namespace ShadowingPlayer
         private readonly Button sentenceEndLaterButton = new Button();
         private readonly ComboBox speedCombo = new ComboBox();
         private readonly ComboBox whisperModelCombo = new ComboBox();
+        private readonly ComboBox transcriptModelCombo = new ComboBox();
         private readonly NumericUpDown timingStepInput = new NumericUpDown();
         private readonly Label whisperModelStatusLabel = new Label();
+        private readonly Label transcriptModelStatusLabel = new Label();
         private readonly Label statusLabel = new Label();
         private readonly Panel playerPanel = new Panel();
         private readonly RichTextBox transcriptBox = new RichTextBox();
@@ -46,15 +49,21 @@ namespace ShadowingPlayer
         private readonly Timer waveformTimer = new Timer();
         private readonly List<TranscriptSegment> transcriptSegments = new List<TranscriptSegment>();
         private MpvController mpv;
+        private Process activeTranscriptionProcess;
         private string currentVideoPath;
         private string currentTranscriptPath;
+        private string activeTranscriptionOutputPath;
         private float[] waveformPeaks = new float[0];
         private double waveformDurationSeconds;
         private bool subtitlesVisible = true;
         private bool sentenceModeEnabled;
         private bool waveformVisible;
         private bool waveformTimerBusy;
+        private bool isClosingConfirmed;
+        private bool isShutdownInProgress;
+        private bool transcriptModelSelectionBusy;
         private int currentSentenceIndex = -1;
+        private string currentTranscriptModel;
 
         public MainForm()
         {
@@ -118,10 +127,21 @@ namespace ShadowingPlayer
             whisperModelCombo.SelectedIndex = 1;
             whisperModelCombo.SelectedIndexChanged += delegate { UpdateWhisperModelStatus(); };
 
+            transcriptModelCombo.DropDownStyle = ComboBoxStyle.DropDownList;
+            transcriptModelCombo.Width = 96;
+            transcriptModelCombo.Enabled = false;
+            transcriptModelCombo.SelectedIndexChanged += async delegate { await LoadSelectedTranscriptModelAsync(); };
+
             whisperModelStatusLabel.AutoSize = false;
             whisperModelStatusLabel.Width = 112;
             whisperModelStatusLabel.Height = 28;
             whisperModelStatusLabel.TextAlign = ContentAlignment.MiddleLeft;
+
+            transcriptModelStatusLabel.AutoSize = false;
+            transcriptModelStatusLabel.Width = 140;
+            transcriptModelStatusLabel.Height = 28;
+            transcriptModelStatusLabel.TextAlign = ContentAlignment.MiddleLeft;
+            transcriptModelStatusLabel.Text = "Transcript: none";
 
             subtitlesButton.Text = "Subtitles: On";
             subtitlesButton.Width = 112;
@@ -201,6 +221,9 @@ namespace ShadowingPlayer
             toolbar.Controls.Add(new Label { Text = "Model", AutoSize = true, Padding = new Padding(8, 6, 0, 0) });
             toolbar.Controls.Add(whisperModelCombo);
             toolbar.Controls.Add(whisperModelStatusLabel);
+            toolbar.Controls.Add(new Label { Text = "Transcript", AutoSize = true, Padding = new Padding(8, 6, 0, 0) });
+            toolbar.Controls.Add(transcriptModelCombo);
+            toolbar.Controls.Add(transcriptModelStatusLabel);
             toolbar.Controls.Add(subtitlesButton);
             toolbar.Controls.Add(sentenceModeButton);
             toolbar.Controls.Add(previousSentenceButton);
@@ -225,6 +248,10 @@ namespace ShadowingPlayer
             waveformPanel.BoundaryChanged += async delegate(object sender, WaveformBoundaryChangedEventArgs args)
             {
                 await SetSentenceBoundaryFromWaveformAsync(args.IsStartBoundary, TimeSpan.FromSeconds(args.Seconds));
+            };
+            waveformPanel.BoundaryDragStarted += async delegate
+            {
+                await PauseForBoundaryAdjustmentAsync();
             };
             waveformPanel.SeekRequested += async delegate(object sender, WaveformSeekEventArgs args)
             {
@@ -252,8 +279,49 @@ namespace ShadowingPlayer
             Controls.Add(playerPanel);
             Controls.Add(transcriptBox);
             Controls.Add(toolbar);
-            FormClosing += async delegate { await ShutdownAsync(); };
+            FormClosing += MainForm_FormClosing;
             UpdateWhisperModelStatus();
+        }
+
+        private async void MainForm_FormClosing(object sender, FormClosingEventArgs e)
+        {
+            if (isClosingConfirmed || isShutdownInProgress)
+            {
+                return;
+            }
+
+            e.Cancel = true;
+
+            if (IsTranscriptionRunning())
+            {
+                var result = MessageBox.Show(
+                    this,
+                    "A transcription is still running.\r\n\r\nChoose Yes to quit now and cancel it, or No to keep waiting.",
+                    "Transcription In Progress",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning,
+                    MessageBoxDefaultButton.Button2);
+
+                if (result != DialogResult.Yes)
+                {
+                    statusLabel.Text = "Transcription is still running.";
+                    return;
+                }
+
+                await CancelActiveTranscriptionAsync();
+            }
+
+            isShutdownInProgress = true;
+            try
+            {
+                await ShutdownAsync();
+                isClosingConfirmed = true;
+                Close();
+            }
+            finally
+            {
+                isShutdownInProgress = false;
+            }
         }
 
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
@@ -332,12 +400,14 @@ namespace ShadowingPlayer
                     waveformPanel.SetMessage("Waveform not loaded.");
                     transcriptSegments.Clear();
                     currentSentenceIndex = -1;
+                    currentTranscriptModel = null;
                     subtitlesVisible = true;
                     subtitlesButton.Text = "Subtitles: On";
                     UpdateSentenceModeButtons();
                     transcriptBox.Text = "Transcript will appear here.";
                     statusLabel.Text = Path.GetFileName(dialog.FileName);
 
+                    RefreshTranscriptModelChoices();
                     await LoadCachedTranscriptAsync();
                 }
                 catch (Exception ex)
@@ -362,11 +432,12 @@ namespace ShadowingPlayer
             var srtPath = GetTranscriptCachePath(currentVideoPath, GetSelectedWhisperModel());
             if (!File.Exists(srtPath))
             {
+                RefreshTranscriptModelChoices();
                 return;
             }
 
             await Task.Delay(500);
-            await LoadTranscriptFromSrtAsync(srtPath, "Loaded cached transcript.");
+            await LoadTranscriptFromSrtAsync(srtPath, "Loaded cached transcript.", GetSelectedWhisperModel());
         }
 
         private async Task TranscribeCurrentVideoAsync()
@@ -385,7 +456,7 @@ namespace ShadowingPlayer
 
                 if (File.Exists(srtPath))
                 {
-                    await LoadTranscriptFromSrtAsync(srtPath, "Loaded cached transcript.");
+                    await LoadTranscriptFromSrtAsync(srtPath, "Loaded cached transcript.", GetSelectedWhisperModel());
                     return;
                 }
 
@@ -410,28 +481,47 @@ namespace ShadowingPlayer
                 transcriptBox.Text = "Transcribing with faster-whisper model " + modelName + ". The first run may download the model...";
                 statusLabel.Text = "Transcribing with " + modelName + "...";
 
-                await RunTranscriptionAsync(pythonPath, scriptPath, currentVideoPath, srtPath, modelName);
+                var transcriptionOutput = await RunTranscriptionAsync(pythonPath, scriptPath, currentVideoPath, srtPath, modelName);
+                var deviceSummary = ExtractTranscriptionDeviceSummary(transcriptionOutput);
                 UpdateWhisperModelStatus();
-                await LoadTranscriptFromSrtAsync(srtPath, "Transcript saved and loaded as subtitles.");
+                await LoadTranscriptFromSrtAsync(srtPath, "Transcript saved and loaded as subtitles.", modelName);
+
+                if (!string.IsNullOrWhiteSpace(deviceSummary))
+                {
+                    statusLabel.Text = "Transcript saved and loaded as subtitles. " + deviceSummary;
+                }
             }
             catch (Exception ex)
             {
-                transcriptBox.Text = ex.Message;
-                statusLabel.Text = "Transcription failed.";
+                if (!isClosingConfirmed && !IsDisposed)
+                {
+                    transcriptBox.Text = ex.Message;
+                    statusLabel.Text = "Transcription failed.";
+                }
             }
             finally
             {
-                transcribeButton.Enabled = true;
+                if (!isClosingConfirmed && !IsDisposed)
+                {
+                    transcribeButton.Enabled = true;
+                }
             }
         }
 
-        private async Task LoadTranscriptFromSrtAsync(string srtPath, string message)
+        private async Task LoadTranscriptFromSrtAsync(string srtPath, string message, string transcriptModel)
         {
+            var previousSentenceIndex = currentSentenceIndex;
+            var playbackPosition = await TryGetPlaybackPositionAsync();
+
             transcriptSegments.Clear();
             transcriptSegments.AddRange(ParseSrtFile(srtPath));
+            ApplyOrPromoteMasterTranscript(currentVideoPath, transcriptModel, transcriptSegments);
+            WriteSrtFile(srtPath, transcriptSegments);
+
             currentTranscriptPath = srtPath;
-            currentSentenceIndex = transcriptSegments.Count > 0 ? 0 : -1;
-            transcriptBox.Text = BuildTranscriptText(message, transcriptSegments);
+            currentTranscriptModel = transcriptModel;
+            currentSentenceIndex = ResolveSentenceIndexForTranscriptReload(playbackPosition, previousSentenceIndex);
+            transcriptBox.Text = BuildTranscriptText(message + " Model: " + transcriptModel + ".", transcriptSegments);
 
             await mpv.AddSubtitleAsync(srtPath);
             await Task.Delay(100);
@@ -440,8 +530,16 @@ namespace ShadowingPlayer
             await mpv.SetSubtitleVisibilityAsync(true);
             await LoadSentenceSegmentsIntoPlayerAsync();
             UpdateWaveformSentences();
+            if (playbackPosition.HasValue)
+            {
+                waveformPanel.SetPlaybackPosition(
+                    GetWaveformDisplayPosition(playbackPosition.Value).TotalSeconds,
+                    currentSentenceIndex);
+            }
+            RefreshTranscriptModelChoices();
             UpdateSentenceModeButtons();
             SelectCurrentSentenceText();
+            UpdateTranscriptModelStatus();
             statusLabel.Text = message + " " + transcriptSegments.Count + " sentences.";
         }
 
@@ -495,6 +593,36 @@ namespace ShadowingPlayer
             {
                 sentenceModeEnabled = false;
                 UpdateSentenceModeButtons();
+                statusLabel.Text = ex.Message;
+            }
+        }
+
+        private async Task LoadSelectedTranscriptModelAsync()
+        {
+            if (transcriptModelSelectionBusy || string.IsNullOrWhiteSpace(currentVideoPath))
+            {
+                return;
+            }
+
+            var selectedModel = transcriptModelCombo.SelectedItem as string;
+            if (string.IsNullOrWhiteSpace(selectedModel) || selectedModel == currentTranscriptModel)
+            {
+                return;
+            }
+
+            var srtPath = GetTranscriptCachePath(currentVideoPath, selectedModel);
+            if (!File.Exists(srtPath))
+            {
+                UpdateTranscriptModelStatus();
+                return;
+            }
+
+            try
+            {
+                await LoadTranscriptFromSrtAsync(srtPath, "Loaded cached transcript.", selectedModel);
+            }
+            catch (Exception ex)
+            {
                 statusLabel.Text = ex.Message;
             }
         }
@@ -608,6 +736,8 @@ namespace ShadowingPlayer
                     return;
                 }
 
+                await PauseForBoundaryAdjustmentAsync();
+
                 if (currentSentenceIndex < 0)
                 {
                     currentSentenceIndex = 0;
@@ -624,9 +754,10 @@ namespace ShadowingPlayer
                     return;
                 }
 
-                if (!string.IsNullOrWhiteSpace(currentTranscriptPath))
+                if (!string.IsNullOrWhiteSpace(currentVideoPath))
                 {
-                    WriteSrtFile(currentTranscriptPath, transcriptSegments);
+                    SaveUserEditedMasterTranscript(currentVideoPath, currentTranscriptModel, transcriptSegments);
+                    SyncMasterTranscriptTimings(currentVideoPath);
                 }
 
                 transcriptBox.Text = BuildTranscriptText("Adjusted transcript timing.", transcriptSegments);
@@ -720,6 +851,8 @@ namespace ShadowingPlayer
                     return;
                 }
 
+                await PauseForBoundaryAdjustmentAsync();
+
                 currentSentenceIndex = Math.Max(0, Math.Min(transcriptSegments.Count - 1, currentSentenceIndex));
                 var changed = adjustStart
                     ? SetSentenceStart(currentSentenceIndex, boundary)
@@ -732,9 +865,10 @@ namespace ShadowingPlayer
                     return;
                 }
 
-                if (!string.IsNullOrWhiteSpace(currentTranscriptPath))
+                if (!string.IsNullOrWhiteSpace(currentVideoPath))
                 {
-                    WriteSrtFile(currentTranscriptPath, transcriptSegments);
+                    SaveUserEditedMasterTranscript(currentVideoPath, currentTranscriptModel, transcriptSegments);
+                    SyncMasterTranscriptTimings(currentVideoPath);
                 }
 
                 transcriptBox.Text = BuildTranscriptText("Adjusted transcript timing.", transcriptSegments);
@@ -851,6 +985,49 @@ namespace ShadowingPlayer
             await mpv.LoadSentenceSegmentsAsync(serializer.Serialize(items));
         }
 
+        private async Task<TimeSpan?> TryGetPlaybackPositionAsync()
+        {
+            if (mpv == null)
+            {
+                return null;
+            }
+
+            try
+            {
+                var timePosition = await mpv.GetTimePositionAsync();
+                return timePosition.HasValue ? TimeSpan.FromSeconds(timePosition.Value) : (TimeSpan?)null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private int ResolveSentenceIndexForTranscriptReload(TimeSpan? playbackPosition, int previousSentenceIndex)
+        {
+            if (transcriptSegments.Count == 0)
+            {
+                return -1;
+            }
+
+            if (sentenceModeEnabled && previousSentenceIndex >= 0)
+            {
+                return Math.Max(0, Math.Min(transcriptSegments.Count - 1, previousSentenceIndex));
+            }
+
+            if (playbackPosition.HasValue)
+            {
+                return FindSentenceIndexAt(playbackPosition.Value);
+            }
+
+            if (previousSentenceIndex >= 0)
+            {
+                return Math.Max(0, Math.Min(transcriptSegments.Count - 1, previousSentenceIndex));
+            }
+
+            return 0;
+        }
+
         private void UpdateCurrentSentenceStatus()
         {
             currentSentenceIndex = Math.Max(0, Math.Min(transcriptSegments.Count - 1, currentSentenceIndex));
@@ -878,21 +1055,43 @@ namespace ShadowingPlayer
                 var playbackPosition = TimeSpan.FromSeconds(timePosition.Value);
                 if (transcriptSegments.Count > 0)
                 {
-                    var sentenceIndex = FindSentenceIndexAt(playbackPosition);
-                    if (sentenceIndex != currentSentenceIndex)
+                    if (sentenceModeEnabled)
                     {
-                        currentSentenceIndex = sentenceIndex;
-                        SelectCurrentSentenceText();
+                        currentSentenceIndex = Math.Max(0, Math.Min(transcriptSegments.Count - 1, currentSentenceIndex));
+                    }
+                    else
+                    {
+                        var sentenceIndex = FindSentenceIndexAt(playbackPosition);
+                        if (sentenceIndex != currentSentenceIndex)
+                        {
+                            currentSentenceIndex = sentenceIndex;
+                            SelectCurrentSentenceText();
+                        }
                     }
                 }
 
-                waveformPanel.SetPlaybackPosition(timePosition.Value, currentSentenceIndex);
                 UpdateWaveformSentences();
+                waveformPanel.SetPlaybackPosition(GetWaveformDisplayPosition(playbackPosition).TotalSeconds, currentSentenceIndex);
             }
             finally
             {
                 waveformTimerBusy = false;
             }
+        }
+
+        private TimeSpan GetWaveformDisplayPosition(TimeSpan playbackPosition)
+        {
+            if (!sentenceModeEnabled ||
+                currentSentenceIndex < 0 ||
+                currentSentenceIndex >= transcriptSegments.Count)
+            {
+                return playbackPosition;
+            }
+
+            return Clamp(
+                playbackPosition,
+                transcriptSegments[currentSentenceIndex].Start,
+                GetEffectiveSentenceEnd(currentSentenceIndex));
         }
 
         private void UpdateWaveformSentences()
@@ -1050,7 +1249,7 @@ namespace ShadowingPlayer
             return 1.0;
         }
 
-        private static async Task<string> RunTranscriptionAsync(string pythonPath, string scriptPath, string mediaPath, string srtPath, string modelName)
+        private async Task<string> RunTranscriptionAsync(string pythonPath, string scriptPath, string mediaPath, string srtPath, string modelName)
         {
             var startInfo = new ProcessStartInfo
             {
@@ -1059,6 +1258,7 @@ namespace ShadowingPlayer
                     QuoteArgument(scriptPath) + " " +
                     QuoteArgument(mediaPath) + " " +
                     "--model " + QuoteArgument(modelName) + " " +
+                    "--device cuda " +
                     "--srt " + QuoteArgument(srtPath),
                 UseShellExecute = false,
                 CreateNoWindow = true,
@@ -1068,11 +1268,18 @@ namespace ShadowingPlayer
                 StandardErrorEncoding = System.Text.Encoding.UTF8,
             };
 
-            using (var process = new Process { StartInfo = startInfo })
+            var process = new Process { StartInfo = startInfo };
+            activeTranscriptionProcess = process;
+            activeTranscriptionOutputPath = srtPath;
+
+            try
             {
                 startInfo.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8";
                 startInfo.EnvironmentVariables["HF_HOME"] = WhisperModelCacheRoot;
                 startInfo.EnvironmentVariables["HUGGINGFACE_HUB_CACHE"] = Path.Combine(WhisperModelCacheRoot, "hub");
+                startInfo.EnvironmentVariables["CUDA_PATH"] = @"E:\tools\cuda";
+                startInfo.EnvironmentVariables["CUDNN_PATH"] = @"E:\tools\CUDNN Runtime";
+                startInfo.EnvironmentVariables["PATH"] = BuildTranscriptionPath(startInfo.EnvironmentVariables["PATH"]);
 
                 if (!process.Start())
                 {
@@ -1094,6 +1301,55 @@ namespace ShadowingPlayer
 
                 return output;
             }
+            finally
+            {
+                if (ReferenceEquals(activeTranscriptionProcess, process))
+                {
+                    activeTranscriptionProcess = null;
+                    activeTranscriptionOutputPath = null;
+                }
+
+                process.Dispose();
+            }
+        }
+
+        private static string ExtractTranscriptionDeviceSummary(string output)
+        {
+            if (string.IsNullOrWhiteSpace(output))
+            {
+                return string.Empty;
+            }
+
+            using (var reader = new StringReader(output))
+            {
+                string line;
+                while ((line = reader.ReadLine()) != null)
+                {
+                    if (line.IndexOf("Using device:", StringComparison.OrdinalIgnoreCase) == 0)
+                    {
+                        return line.Trim();
+                    }
+                }
+            }
+
+            return string.Empty;
+        }
+
+        private async Task PauseForBoundaryAdjustmentAsync()
+        {
+            if (mpv == null)
+            {
+                return;
+            }
+
+            try
+            {
+                await mpv.SetPauseAsync(true);
+            }
+            catch (Exception ex)
+            {
+                statusLabel.Text = ex.Message;
+            }
         }
 
         private static string ResolveAppPath(string relativePath)
@@ -1114,6 +1370,53 @@ namespace ShadowingPlayer
             return "\"" + value.Replace("\"", "\\\"") + "\"";
         }
 
+        private static string BuildTranscriptionPath(string existingPath)
+        {
+            var orderedPaths = new List<string>();
+            AddExistingDirectory(orderedPaths, @"E:\tools\cuda\bin");
+            AddExistingDirectory(orderedPaths, @"E:\tools\cuda\bin\x64");
+            AddExistingDirectory(orderedPaths, @"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin");
+            AddExistingDirectory(orderedPaths, @"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.3\bin");
+            AddExistingDirectory(orderedPaths, @"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.2\bin");
+            AddExistingDirectory(orderedPaths, @"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.1\bin");
+            AddExistingDirectory(orderedPaths, @"E:\Application\anaconda\envs\deeplearning\Lib\site-packages\torch\lib");
+            AddExistingDirectory(orderedPaths, @"E:\Application\webui\webui_forge_cu121_torch231\system\python\Lib\site-packages\torch\lib");
+            AddExistingDirectory(orderedPaths, @"E:\tools\CUDNN Runtime\bin\13.3\x64");
+
+            if (!string.IsNullOrWhiteSpace(existingPath))
+            {
+                orderedPaths.Add(existingPath);
+            }
+
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var builder = new StringBuilder();
+            for (var i = 0; i < orderedPaths.Count; i++)
+            {
+                var path = orderedPaths[i];
+                if (string.IsNullOrWhiteSpace(path) || !seen.Add(path))
+                {
+                    continue;
+                }
+
+                if (builder.Length > 0)
+                {
+                    builder.Append(';');
+                }
+
+                builder.Append(path);
+            }
+
+            return builder.ToString();
+        }
+
+        private static void AddExistingDirectory(List<string> paths, string candidate)
+        {
+            if (!string.IsNullOrWhiteSpace(candidate) && Directory.Exists(candidate))
+            {
+                paths.Add(candidate);
+            }
+        }
+
         private string GetSelectedWhisperModel()
         {
             var selected = whisperModelCombo.SelectedItem as string;
@@ -1126,6 +1429,65 @@ namespace ShadowingPlayer
             var downloaded = IsWhisperModelDownloaded(modelName);
             whisperModelStatusLabel.Text = downloaded ? "Downloaded" : "Not downloaded";
             whisperModelStatusLabel.ForeColor = downloaded ? Color.FromArgb(0, 120, 80) : Color.FromArgb(170, 90, 0);
+        }
+
+        private void RefreshTranscriptModelChoices()
+        {
+            transcriptModelSelectionBusy = true;
+            try
+            {
+                transcriptModelCombo.Items.Clear();
+
+                if (string.IsNullOrWhiteSpace(currentVideoPath))
+                {
+                    transcriptModelCombo.Enabled = false;
+                    UpdateTranscriptModelStatus();
+                    return;
+                }
+
+                foreach (var modelName in GetKnownWhisperModels())
+                {
+                    if (File.Exists(GetTranscriptCachePath(currentVideoPath, modelName)))
+                    {
+                        transcriptModelCombo.Items.Add(modelName);
+                    }
+                }
+
+                transcriptModelCombo.Enabled = transcriptModelCombo.Items.Count > 0;
+                if (!string.IsNullOrWhiteSpace(currentTranscriptModel) &&
+                    transcriptModelCombo.Items.Contains(currentTranscriptModel))
+                {
+                    transcriptModelCombo.SelectedItem = currentTranscriptModel;
+                }
+                else if (transcriptModelCombo.Items.Count > 0)
+                {
+                    transcriptModelCombo.SelectedIndex = 0;
+                }
+
+                UpdateTranscriptModelStatus();
+            }
+            finally
+            {
+                transcriptModelSelectionBusy = false;
+            }
+        }
+
+        private void UpdateTranscriptModelStatus()
+        {
+            if (string.IsNullOrWhiteSpace(currentTranscriptModel))
+            {
+                transcriptModelStatusLabel.Text = "Transcript: none";
+                transcriptModelStatusLabel.ForeColor = SystemColors.ControlText;
+                return;
+            }
+
+            transcriptModelStatusLabel.Text = "Transcript: " + currentTranscriptModel;
+            transcriptModelStatusLabel.ForeColor = Color.FromArgb(0, 102, 204);
+        }
+
+        private static string[] GetKnownWhisperModels()
+        {
+            return new[] { "tiny", "base", "small", "medium", "large-v3" };
         }
 
         private static bool IsWhisperModelDownloaded(string modelName)
@@ -1169,6 +1531,337 @@ namespace ShadowingPlayer
             var safeModelName = string.IsNullOrWhiteSpace(modelName) ? "small" : modelName.Replace('/', '-').Replace('\\', '-');
             var fileName = Path.GetFileNameWithoutExtension(videoPath) + ".shadowing." + safeModelName + ".srt";
             return string.IsNullOrEmpty(directory) ? fileName : Path.Combine(directory, fileName);
+        }
+
+        private static string GetSharedTimingPath(string videoPath)
+        {
+            var directory = Path.GetDirectoryName(videoPath);
+            var fileName = Path.GetFileNameWithoutExtension(videoPath) + ".shadowing.timings.json";
+            return string.IsNullOrEmpty(directory) ? fileName : Path.Combine(directory, fileName);
+        }
+
+        private static void ApplyOrPromoteMasterTranscript(string videoPath, string modelName, List<TranscriptSegment> segments)
+        {
+            if (string.IsNullOrWhiteSpace(videoPath) || segments.Count == 0)
+            {
+                return;
+            }
+
+            TranscriptMasterFile master;
+            var hasMaster = TryLoadMasterTranscript(videoPath, out master);
+            var modelRank = GetWhisperModelRank(modelName);
+
+            if (!hasMaster || (!IsUserEditedMaster(master) && modelRank > master.ModelRank))
+            {
+                SaveMasterTranscript(videoPath, CreateMasterTranscript("model", modelName, modelRank, segments));
+                SyncMasterTranscriptTimings(videoPath);
+                return;
+            }
+
+            ApplyTimingsToSegments(segments, ConvertMasterTimings(master));
+        }
+
+        private static void SaveUserEditedMasterTranscript(string videoPath, string modelName, List<TranscriptSegment> segments)
+        {
+            SaveMasterTranscript(videoPath, CreateMasterTranscript(
+                "user",
+                string.IsNullOrWhiteSpace(modelName) ? "manual" : modelName,
+                GetWhisperModelRank(modelName),
+                segments));
+        }
+
+        private static bool IsUserEditedMaster(TranscriptMasterFile master)
+        {
+            return master != null && string.Equals(master.Source, "user", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static TranscriptMasterFile CreateMasterTranscript(
+            string source,
+            string modelName,
+            int modelRank,
+            List<TranscriptSegment> segments)
+        {
+            var master = new TranscriptMasterFile
+            {
+                Version = 2,
+                Source = source,
+                Model = modelName,
+                ModelRank = modelRank,
+                Timings = new List<TranscriptTimingFileItem>(),
+            };
+
+            for (var i = 0; i < segments.Count; i++)
+            {
+                master.Timings.Add(new TranscriptTimingFileItem
+                {
+                    Start = segments[i].Start.TotalSeconds,
+                    End = segments[i].End.TotalSeconds,
+                });
+            }
+
+            return master;
+        }
+
+        private static void SaveMasterTranscript(string videoPath, TranscriptMasterFile master)
+        {
+            var serializer = new JavaScriptSerializer();
+            File.WriteAllText(GetSharedTimingPath(videoPath), serializer.Serialize(master), Encoding.UTF8);
+        }
+
+        private static void SyncMasterTranscriptTimings(string videoPath)
+        {
+            TranscriptMasterFile master;
+            if (!TryLoadMasterTranscript(videoPath, out master))
+            {
+                return;
+            }
+
+            var timings = ConvertMasterTimings(master);
+            foreach (var modelName in GetKnownWhisperModels())
+            {
+                var transcriptPath = GetTranscriptCachePath(videoPath, modelName);
+                if (!File.Exists(transcriptPath))
+                {
+                    continue;
+                }
+
+                var segments = ParseSrtFile(transcriptPath);
+                ApplyTimingsToSegments(segments, timings);
+                WriteSrtFile(transcriptPath, segments);
+            }
+        }
+
+        private static bool TryLoadMasterTranscript(string videoPath, out TranscriptMasterFile master)
+        {
+            master = null;
+            var path = GetSharedTimingPath(videoPath);
+            if (!File.Exists(path))
+            {
+                return false;
+            }
+
+            try
+            {
+                var serializer = new JavaScriptSerializer();
+                var json = File.ReadAllText(path, Encoding.UTF8);
+                if (json.TrimStart().StartsWith("[", StringComparison.Ordinal))
+                {
+                    var legacyItems = serializer.Deserialize<List<Dictionary<string, object>>>(json);
+                    if (legacyItems == null || legacyItems.Count == 0)
+                    {
+                        return false;
+                    }
+
+                    master = new TranscriptMasterFile
+                    {
+                        Version = 1,
+                        Source = "user",
+                        Model = "legacy",
+                        ModelRank = 0,
+                        Timings = new List<TranscriptTimingFileItem>(),
+                    };
+
+                    for (var i = 0; i < legacyItems.Count; i++)
+                    {
+                        object startValue;
+                        object endValue;
+                        if (!legacyItems[i].TryGetValue("start", out startValue) ||
+                            !legacyItems[i].TryGetValue("end", out endValue))
+                        {
+                            return false;
+                        }
+
+                        master.Timings.Add(new TranscriptTimingFileItem
+                        {
+                            Start = Convert.ToDouble(startValue, CultureInfo.InvariantCulture),
+                            End = Convert.ToDouble(endValue, CultureInfo.InvariantCulture),
+                        });
+                    }
+
+                    return true;
+                }
+
+                master = serializer.Deserialize<TranscriptMasterFile>(json);
+                return master != null && master.Timings != null && master.Timings.Count > 0;
+            }
+            catch
+            {
+                master = null;
+                return false;
+            }
+        }
+
+        private static List<TranscriptTiming> ConvertMasterTimings(TranscriptMasterFile master)
+        {
+            var items = new List<TranscriptTiming>();
+            if (master == null || master.Timings == null)
+            {
+                return items;
+            }
+
+            for (var i = 0; i < master.Timings.Count; i++)
+            {
+                items.Add(new TranscriptTiming(
+                    TimeSpan.FromSeconds(master.Timings[i].Start),
+                    TimeSpan.FromSeconds(master.Timings[i].End)));
+            }
+
+            return items;
+        }
+
+        private static void ApplyTimingsToSegments(List<TranscriptSegment> segments, List<TranscriptTiming> timings)
+        {
+            if (segments.Count == 0 || timings.Count == 0)
+            {
+                return;
+            }
+
+            if (segments.Count == timings.Count)
+            {
+                for (var i = 0; i < segments.Count; i++)
+                {
+                    segments[i].SetStart(timings[i].Start);
+                    segments[i].SetEnd(timings[i].End);
+                }
+
+                NormalizeAdjacentSegmentText(segments);
+                return;
+            }
+
+            var aligned = AlignTranscriptTextToTimings(segments, timings);
+            segments.Clear();
+            segments.AddRange(aligned);
+            NormalizeAdjacentSegmentText(segments);
+        }
+
+        private static List<TranscriptSegment> AlignTranscriptTextToTimings(
+            List<TranscriptSegment> sourceSegments,
+            List<TranscriptTiming> timings)
+        {
+            var aligned = new List<TranscriptSegment>();
+            for (var i = 0; i < timings.Count; i++)
+            {
+                var text = new StringBuilder();
+                for (var j = 0; j < sourceSegments.Count; j++)
+                {
+                    if (Overlaps(sourceSegments[j].Start, sourceSegments[j].End, timings[i].Start, timings[i].End))
+                    {
+                        if (text.Length > 0)
+                        {
+                            text.Append(" ");
+                        }
+
+                        text.Append(sourceSegments[j].Text);
+                    }
+                }
+
+                if (text.Length == 0)
+                {
+                    var fallbackIndex = timings.Count <= 1
+                        ? 0
+                        : (int)Math.Round(i * (sourceSegments.Count - 1) / (double)(timings.Count - 1));
+                    fallbackIndex = Math.Max(0, Math.Min(sourceSegments.Count - 1, fallbackIndex));
+                    text.Append(sourceSegments[fallbackIndex].Text);
+                }
+
+                aligned.Add(new TranscriptSegment(timings[i].Start, timings[i].End, text.ToString()));
+            }
+
+            return aligned;
+        }
+
+        private static bool Overlaps(TimeSpan firstStart, TimeSpan firstEnd, TimeSpan secondStart, TimeSpan secondEnd)
+        {
+            return firstStart < secondEnd && firstEnd > secondStart;
+        }
+
+        private static void NormalizeAdjacentSegmentText(List<TranscriptSegment> segments)
+        {
+            for (var i = 1; i < segments.Count; i++)
+            {
+                var trimmed = RemoveRepeatedPrefixFromCurrentSegment(segments[i - 1].Text, segments[i].Text);
+                if (!string.Equals(trimmed, segments[i].Text, StringComparison.Ordinal))
+                {
+                    segments[i].SetText(trimmed);
+                }
+            }
+        }
+
+        private static string RemoveRepeatedPrefixFromCurrentSegment(string previousText, string currentText)
+        {
+            if (string.IsNullOrWhiteSpace(previousText) || string.IsNullOrWhiteSpace(currentText))
+            {
+                return currentText;
+            }
+
+            var previousTokens = GetOverlapTokens(previousText);
+            var currentTokens = GetOverlapTokens(currentText);
+            if (previousTokens.Count == 0 || currentTokens.Count == 0)
+            {
+                return currentText;
+            }
+
+            const int minimumOverlapWords = 4;
+            var maxOverlap = Math.Min(previousTokens.Count, currentTokens.Count - 1);
+            for (var overlap = maxOverlap; overlap >= minimumOverlapWords; overlap--)
+            {
+                var matches = true;
+                for (var offset = 0; offset < overlap; offset++)
+                {
+                    if (!string.Equals(
+                        previousTokens[previousTokens.Count - overlap + offset].Normalized,
+                        currentTokens[offset].Normalized,
+                        StringComparison.Ordinal))
+                    {
+                        matches = false;
+                        break;
+                    }
+                }
+
+                if (matches)
+                {
+                    var cutIndex = currentTokens[overlap].StartIndex;
+                    return currentText.Substring(cutIndex).TrimStart();
+                }
+            }
+
+            return currentText;
+        }
+
+        private static List<OverlapToken> GetOverlapTokens(string text)
+        {
+            var tokens = new List<OverlapToken>();
+            foreach (Match match in Regex.Matches(text ?? string.Empty, @"[\p{L}\p{N}']+"))
+            {
+                var normalized = match.Value.Trim().ToLowerInvariant();
+                if (normalized.Length == 0)
+                {
+                    continue;
+                }
+
+                tokens.Add(new OverlapToken(normalized, match.Index));
+            }
+
+            return tokens;
+        }
+
+        private static int GetWhisperModelRank(string modelName)
+        {
+            switch ((modelName ?? string.Empty).Trim().ToLowerInvariant())
+            {
+                case "tiny":
+                    return 1;
+                case "base":
+                    return 2;
+                case "small":
+                    return 3;
+                case "medium":
+                    return 4;
+                case "large-v3":
+                    return 5;
+                default:
+                    return 0;
+            }
         }
 
         private static string GetWaveformCachePath(string videoPath)
@@ -1516,11 +2209,50 @@ namespace ShadowingPlayer
             mpv = await MpvController.StartAsync(videoHost.Handle);
         }
 
+        private bool IsTranscriptionRunning()
+        {
+            return activeTranscriptionProcess != null && !activeTranscriptionProcess.HasExited;
+        }
+
+        private async Task CancelActiveTranscriptionAsync()
+        {
+            var process = activeTranscriptionProcess;
+            if (process == null)
+            {
+                return;
+            }
+
+            try
+            {
+                if (!process.HasExited)
+                {
+                    process.Kill();
+                    await Task.Run(new Action(process.WaitForExit));
+                }
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(activeTranscriptionOutputPath) &&
+                    File.Exists(activeTranscriptionOutputPath))
+                {
+                    File.Delete(activeTranscriptionOutputPath);
+                }
+            }
+            catch
+            {
+            }
+        }
+
         private async Task ShutdownAsync()
         {
             try
             {
                 waveformTimer.Stop();
+                await CancelActiveTranscriptionAsync();
                 if (mpv != null)
                 {
                     await mpv.DisableSentenceModeAsync();
@@ -1547,6 +2279,39 @@ namespace ShadowingPlayer
             public double DurationSeconds { get; private set; }
         }
 
+        private sealed class TranscriptTiming
+        {
+            public TranscriptTiming(TimeSpan start, TimeSpan end)
+            {
+                Start = start;
+                End = end;
+            }
+
+            public TimeSpan Start { get; private set; }
+
+            public TimeSpan End { get; private set; }
+        }
+
+        private sealed class TranscriptMasterFile
+        {
+            public int Version { get; set; }
+
+            public string Source { get; set; }
+
+            public string Model { get; set; }
+
+            public int ModelRank { get; set; }
+
+            public List<TranscriptTimingFileItem> Timings { get; set; }
+        }
+
+        private sealed class TranscriptTimingFileItem
+        {
+            public double Start { get; set; }
+
+            public double End { get; set; }
+        }
+
         private sealed class TranscriptSegment
         {
             public TranscriptSegment(TimeSpan start, TimeSpan end, string text)
@@ -1571,6 +2336,24 @@ namespace ShadowingPlayer
             {
                 End = end;
             }
+
+            public void SetText(string text)
+            {
+                Text = text;
+            }
+        }
+
+        private sealed class OverlapToken
+        {
+            public OverlapToken(string normalized, int startIndex)
+            {
+                Normalized = normalized;
+                StartIndex = startIndex;
+            }
+
+            public string Normalized { get; private set; }
+
+            public int StartIndex { get; private set; }
         }
     }
 }

@@ -27,6 +27,8 @@ namespace ShadowingPlayer
 
         public event EventHandler<WaveformBoundaryChangedEventArgs> BoundaryChanged;
 
+        public event EventHandler BoundaryDragStarted;
+
         public event EventHandler<WaveformSeekEventArgs> SeekRequested;
 
         public void SetWaveform(float[] values, double duration)
@@ -103,6 +105,7 @@ namespace ShadowingPlayer
                 draggingStart = true;
                 dragSeconds = XToTime(e.X, window);
                 Capture = true;
+                OnBoundaryDragStarted();
             }
             else if (Math.Abs(e.X - endX) <= 8)
             {
@@ -110,6 +113,7 @@ namespace ShadowingPlayer
                 draggingStart = false;
                 dragSeconds = XToTime(e.X, window);
                 Capture = true;
+                OnBoundaryDragStarted();
             }
         }
 
@@ -172,6 +176,15 @@ namespace ShadowingPlayer
             {
                 var size = graphics.MeasureString(text, Font);
                 graphics.DrawString(text, Font, brush, (Width - size.Width) / 2f, (Height - size.Height) / 2f);
+            }
+        }
+
+        private void OnBoundaryDragStarted()
+        {
+            var handler = BoundaryDragStarted;
+            if (handler != null)
+            {
+                handler(this, EventArgs.Empty);
             }
         }
 
