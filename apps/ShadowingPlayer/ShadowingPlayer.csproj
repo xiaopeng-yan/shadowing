@@ -45,6 +45,7 @@
     <Compile Include="MpvController.cs" />
     <Compile Include="Program.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
+    <Compile Include="SubtitleOverlayControl.cs" />
     <Compile Include="WaveformPanel.cs" />
   </ItemGroup>
   <ItemGroup>

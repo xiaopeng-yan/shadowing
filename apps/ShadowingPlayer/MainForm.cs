@@ -45,6 +45,7 @@ namespace ShadowingPlayer
         private readonly Label statusLabel = new Label();
         private readonly Panel playerPanel = new Panel();
         private readonly RichTextBox transcriptBox = new RichTextBox();
+        private readonly SubtitleOverlayControl subtitleOverlay = new SubtitleOverlayControl();
         private readonly WaveformPanel waveformPanel = new WaveformPanel();
         private readonly Timer waveformTimer = new Timer();
         private readonly List<TranscriptSegment> transcriptSegments = new List<TranscriptSegment>();
@@ -245,6 +246,10 @@ namespace ShadowingPlayer
             videoHost.Dock = DockStyle.Fill;
             videoHost.BackColor = Color.Black;
 
+            subtitleOverlay.Dock = DockStyle.None;
+            subtitleOverlay.Height = 120;
+            subtitleOverlay.Visible = false;
+
             waveformPanel.Dock = DockStyle.Bottom;
             waveformPanel.Visible = false;
             waveformPanel.BoundaryChanged += async delegate(object sender, WaveformBoundaryChangedEventArgs args)
@@ -272,8 +277,13 @@ namespace ShadowingPlayer
             waveformTimer.Tick += async delegate { await UpdateWaveformPlaybackAsync(); };
 
             playerPanel.Dock = DockStyle.Fill;
+            playerPanel.Resize += delegate { LayoutSubtitleOverlay(); };
             playerPanel.Controls.Add(videoHost);
             playerPanel.Controls.Add(waveformPanel);
+            playerPanel.Controls.Add(subtitleOverlay);
+            subtitleOverlay.Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
+            subtitleOverlay.BringToFront();
+            LayoutSubtitleOverlay();
 
             transcriptBox.Dock = DockStyle.Right;
             transcriptBox.Width = 360;
@@ -413,10 +423,13 @@ namespace ShadowingPlayer
                     currentTranscriptModel = null;
                     subtitlesVisible = true;
                     subtitlesButton.Text = "Subtitles: On";
+                    subtitleOverlay.SetSubtitle(string.Empty);
+                    subtitleOverlay.Visible = false;
                     UpdateSentenceModeButtons();
                     transcriptBox.Text = "Transcript will appear here.";
                     statusLabel.Text = Path.GetFileName(dialog.FileName);
 
+                    waveformTimer.Start();
                     RefreshTranscriptModelChoices();
                     await LoadCachedTranscriptAsync();
                 }
@@ -533,11 +546,9 @@ namespace ShadowingPlayer
             currentSentenceIndex = ResolveSentenceIndexForTranscriptReload(playbackPosition, previousSentenceIndex);
             transcriptBox.Text = BuildTranscriptText(message + " Model: " + transcriptModel + ".", transcriptSegments);
 
-            await mpv.AddSubtitleAsync(srtPath);
-            await Task.Delay(100);
             subtitlesVisible = true;
             subtitlesButton.Text = "Subtitles: On";
-            await mpv.SetSubtitleVisibilityAsync(true);
+            await EnsureNativeSubtitlesHiddenAsync();
             await LoadSentenceSegmentsIntoPlayerAsync();
             UpdateWaveformSentences();
             if (playbackPosition.HasValue)
@@ -549,6 +560,7 @@ namespace ShadowingPlayer
             RefreshTranscriptModelChoices();
             UpdateSentenceModeButtons();
             SelectCurrentSentenceText();
+            UpdateSubtitleOverlay();
             UpdateTranscriptModelStatus();
             statusLabel.Text = message + " " + transcriptSegments.Count + " sentences.";
         }
@@ -566,7 +578,8 @@ namespace ShadowingPlayer
 
             try
             {
-                await mpv.SetSubtitleVisibilityAsync(subtitlesVisible);
+                await EnsureNativeSubtitlesHiddenAsync();
+                UpdateSubtitleOverlay();
             }
             catch (Exception ex)
             {
@@ -648,6 +661,7 @@ namespace ShadowingPlayer
             waveformVisible = !waveformVisible;
             waveformPanel.Visible = waveformVisible;
             waveformButton.Text = waveformVisible ? "Waveform: On" : "Waveform: Off";
+            LayoutSubtitleOverlay();
 
             if (!waveformVisible)
             {
@@ -1033,6 +1047,7 @@ namespace ShadowingPlayer
             SelectCurrentSentenceText();
             await LoadSentenceSegmentsIntoPlayerAsync();
             await RefreshLoadedSubtitlesAsync();
+            UpdateSubtitleOverlay();
             UpdateWaveformSentences();
 
             if (sentenceModeEnabled && currentSentenceIndex >= 0)
@@ -1245,12 +1260,13 @@ namespace ShadowingPlayer
             currentSentenceIndex = Math.Max(0, Math.Min(transcriptSegments.Count - 1, currentSentenceIndex));
             SelectCurrentSentenceText();
             UpdateWaveformSentences();
+            UpdateSubtitleOverlay();
             statusLabel.Text = "Sentence " + (currentSentenceIndex + 1) + " / " + transcriptSegments.Count;
         }
 
         private async Task UpdateWaveformPlaybackAsync()
         {
-            if (!waveformVisible || waveformTimerBusy || waveformEditInProgress || mpv == null)
+            if (waveformTimerBusy || waveformEditInProgress || mpv == null)
             {
                 return;
             }
@@ -1282,8 +1298,12 @@ namespace ShadowingPlayer
                     }
                 }
 
-                UpdateWaveformSentences();
-                waveformPanel.SetPlaybackPosition(GetWaveformDisplayPosition(playbackPosition).TotalSeconds, currentSentenceIndex);
+                UpdateSubtitleOverlay();
+                if (waveformVisible)
+                {
+                    UpdateWaveformSentences();
+                    waveformPanel.SetPlaybackPosition(GetWaveformDisplayPosition(playbackPosition).TotalSeconds, currentSentenceIndex);
+                }
             }
             finally
             {
@@ -1586,20 +1606,56 @@ namespace ShadowingPlayer
         // subtitle overlaid on the video reflects the new sentence boundaries.
         private async Task RefreshLoadedSubtitlesAsync()
         {
-            if (mpv == null || string.IsNullOrWhiteSpace(currentTranscriptPath))
+            if (mpv == null)
             {
                 return;
             }
 
             try
             {
-                await mpv.ReloadSubtitleAsync();
-                await mpv.SetSubtitleVisibilityAsync(subtitlesVisible);
+                await EnsureNativeSubtitlesHiddenAsync();
             }
             catch (Exception ex)
             {
                 statusLabel.Text = ex.Message;
             }
+        }
+
+        private async Task EnsureNativeSubtitlesHiddenAsync()
+        {
+            if (mpv == null)
+            {
+                return;
+            }
+
+            await mpv.SetSubtitleVisibilityAsync(false);
+        }
+
+        private void UpdateSubtitleOverlay()
+        {
+            var hasSubtitle = subtitlesVisible &&
+                currentSentenceIndex >= 0 &&
+                currentSentenceIndex < transcriptSegments.Count;
+
+            subtitleOverlay.Visible = hasSubtitle;
+            subtitleOverlay.SetSubtitle(hasSubtitle ? transcriptSegments[currentSentenceIndex].Text : string.Empty);
+            LayoutSubtitleOverlay();
+        }
+
+        private void LayoutSubtitleOverlay()
+        {
+            var bottomInset = waveformPanel.Visible ? waveformPanel.Height : 0;
+            var overlayWidth = Math.Max(240, playerPanel.ClientSize.Width - 24);
+            var overlayHeight = subtitleOverlay.Height;
+            var overlayX = Math.Max(0, (playerPanel.ClientSize.Width - overlayWidth) / 2);
+            var overlayY = Math.Max(0, playerPanel.ClientSize.Height - bottomInset - overlayHeight - 8);
+
+            subtitleOverlay.Bounds = new Rectangle(
+                overlayX,
+                overlayY,
+                overlayWidth,
+                overlayHeight);
+            subtitleOverlay.BringToFront();
         }
 
         private async Task PauseForBoundaryAdjustmentAsync()
