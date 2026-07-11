@@ -32,14 +32,9 @@ namespace ShadowingPlayer
         private readonly Button nextSentenceButton = new Button();
         private readonly Button repeatSentenceButton = new Button();
         private readonly Button waveformButton = new Button();
-        private readonly Button sentenceStartEarlierButton = new Button();
-        private readonly Button sentenceStartLaterButton = new Button();
-        private readonly Button sentenceEndEarlierButton = new Button();
-        private readonly Button sentenceEndLaterButton = new Button();
         private readonly ComboBox speedCombo = new ComboBox();
         private readonly ComboBox whisperModelCombo = new ComboBox();
         private readonly ComboBox transcriptModelCombo = new ComboBox();
-        private readonly NumericUpDown timingStepInput = new NumericUpDown();
         private readonly Label whisperModelStatusLabel = new Label();
         private readonly Label transcriptModelStatusLabel = new Label();
         private readonly Label statusLabel = new Label();
@@ -175,34 +170,6 @@ namespace ShadowingPlayer
             nextSentenceButton.Enabled = false;
             nextSentenceButton.Click += async delegate { await MoveSentenceAsync(1); };
 
-            sentenceStartEarlierButton.Text = "Start -";
-            sentenceStartEarlierButton.Width = 72;
-            sentenceStartEarlierButton.Enabled = false;
-            sentenceStartEarlierButton.Click += async delegate { await AdjustSentenceBoundaryAsync(true, -1); };
-
-            sentenceStartLaterButton.Text = "Start +";
-            sentenceStartLaterButton.Width = 72;
-            sentenceStartLaterButton.Enabled = false;
-            sentenceStartLaterButton.Click += async delegate { await AdjustSentenceBoundaryAsync(true, 1); };
-
-            sentenceEndEarlierButton.Text = "End -";
-            sentenceEndEarlierButton.Width = 72;
-            sentenceEndEarlierButton.Enabled = false;
-            sentenceEndEarlierButton.Click += async delegate { await AdjustSentenceBoundaryAsync(false, -1); };
-
-            sentenceEndLaterButton.Text = "End +";
-            sentenceEndLaterButton.Width = 72;
-            sentenceEndLaterButton.Enabled = false;
-            sentenceEndLaterButton.Click += async delegate { await AdjustSentenceBoundaryAsync(false, 1); };
-
-            timingStepInput.DecimalPlaces = 2;
-            timingStepInput.Increment = 0.05M;
-            timingStepInput.Minimum = 0.01M;
-            timingStepInput.Maximum = 5M;
-            timingStepInput.Value = 0.10M;
-            timingStepInput.Width = 64;
-            timingStepInput.Enabled = false;
-
             speedCombo.DropDownStyle = ComboBoxStyle.DropDownList;
             speedCombo.Width = 90;
             speedCombo.Items.AddRange(new object[] { "0.75x", "1.0x", "1.25x", "1.5x", "2.0x" });
@@ -233,12 +200,6 @@ namespace ShadowingPlayer
             toolbar.Controls.Add(repeatSentenceButton);
             toolbar.Controls.Add(nextSentenceButton);
             toolbar.Controls.Add(waveformButton);
-            toolbar.Controls.Add(sentenceStartEarlierButton);
-            toolbar.Controls.Add(sentenceStartLaterButton);
-            toolbar.Controls.Add(sentenceEndEarlierButton);
-            toolbar.Controls.Add(sentenceEndLaterButton);
-            toolbar.Controls.Add(new Label { Text = "Step", AutoSize = true, Padding = new Padding(8, 6, 0, 0) });
-            toolbar.Controls.Add(timingStepInput);
             toolbar.Controls.Add(new Label { Text = "Speed", AutoSize = true, Padding = new Padding(8, 6, 0, 0) });
             toolbar.Controls.Add(speedCombo);
             toolbar.Controls.Add(statusLabel);
@@ -400,38 +361,7 @@ namespace ShadowingPlayer
 
                 try
                 {
-                    await EnsurePlayerAsync();
-
-                    try
-                    {
-                        await PreparePlayerForNewVideoAsync(dialog.FileName);
-                    }
-                    catch
-                    {
-                        await RestartPlayerAsync();
-                        await PreparePlayerForNewVideoAsync(dialog.FileName);
-                    }
-
-                    currentVideoPath = dialog.FileName;
-                    currentTranscriptPath = null;
-                    waveformPeaks = new float[0];
-                    waveformDurationSeconds = 0;
-                    waveformPanel.SetWaveform(waveformPeaks, waveformDurationSeconds);
-                    waveformPanel.SetMessage("Waveform not loaded.");
-                    transcriptSegments.Clear();
-                    currentSentenceIndex = -1;
-                    currentTranscriptModel = null;
-                    subtitlesVisible = true;
-                    subtitlesButton.Text = "Subtitles: On";
-                    subtitleOverlay.SetSubtitle(string.Empty);
-                    subtitleOverlay.Visible = false;
-                    UpdateSentenceModeButtons();
-                    transcriptBox.Text = "Transcript will appear here.";
-                    statusLabel.Text = Path.GetFileName(dialog.FileName);
-
-                    waveformTimer.Start();
-                    RefreshTranscriptModelChoices();
-                    await LoadCachedTranscriptAsync();
+                    await OpenPreparedVideoAsync(dialog.FileName, Path.GetFileName(dialog.FileName));
                 }
                 catch (Exception ex)
                 {
@@ -441,9 +371,48 @@ namespace ShadowingPlayer
             }
         }
 
+        private async Task OpenPreparedVideoAsync(string videoPath, string displayName)
+        {
+            await EnsurePlayerAsync();
+
+            try
+            {
+                await PreparePlayerForNewVideoAsync(videoPath);
+            }
+            catch
+            {
+                await RestartPlayerAsync();
+                await PreparePlayerForNewVideoAsync(videoPath);
+            }
+
+            currentVideoPath = videoPath;
+            currentTranscriptPath = null;
+            waveformPeaks = new float[0];
+            waveformDurationSeconds = 0;
+            waveformPanel.SetWaveform(waveformPeaks, waveformDurationSeconds);
+            waveformPanel.SetMessage("Waveform not loaded.");
+            transcriptSegments.Clear();
+            currentSentenceIndex = -1;
+            currentTranscriptModel = null;
+            subtitlesVisible = true;
+            subtitlesButton.Text = "Subtitles: On";
+            subtitleOverlay.SetSubtitle(string.Empty);
+            subtitleOverlay.Visible = false;
+            UpdateSentenceModeButtons();
+            transcriptBox.Text = "Transcript will appear here.";
+            statusLabel.Text = displayName;
+
+            waveformTimer.Start();
+            RefreshTranscriptModelChoices();
+            await LoadCachedTranscriptAsync();
+        }
+
         private async Task PreparePlayerForNewVideoAsync(string path)
         {
             sentenceModeEnabled = false;
+            waveformVisible = false;
+            waveformPanel.Visible = false;
+            waveformButton.Text = "Waveform: Off";
             UpdateSentenceModeButtons();
             await mpv.DisableSentenceModeAsync();
             await mpv.LoadSentenceSegmentsAsync("[]");
@@ -452,15 +421,17 @@ namespace ShadowingPlayer
 
         private async Task LoadCachedTranscriptAsync()
         {
-            var srtPath = GetTranscriptCachePath(currentVideoPath, GetSelectedWhisperModel());
-            if (!File.Exists(srtPath))
+            var bestTranscriptPath = GetBestTranscriptCachePath(currentVideoPath);
+            if (string.IsNullOrWhiteSpace(bestTranscriptPath))
             {
                 RefreshTranscriptModelChoices();
                 return;
             }
 
+            var transcriptModel = GetTranscriptModelNameFromPath(currentVideoPath, bestTranscriptPath);
             await Task.Delay(500);
-            await LoadTranscriptFromSrtAsync(srtPath, "Loaded cached transcript.", GetSelectedWhisperModel());
+            await LoadTranscriptFromSrtAsync(bestTranscriptPath, "Loaded cached transcript.", transcriptModel);
+            await EnablePracticeViewAsync();
         }
 
         private async Task TranscribeCurrentVideoAsync()
@@ -563,6 +534,36 @@ namespace ShadowingPlayer
             UpdateSubtitleOverlay();
             UpdateTranscriptModelStatus();
             statusLabel.Text = message + " " + transcriptSegments.Count + " sentences.";
+        }
+
+        private async Task EnablePracticeViewAsync()
+        {
+            subtitlesVisible = true;
+            subtitlesButton.Text = "Subtitles: On";
+            await EnsureNativeSubtitlesHiddenAsync();
+            UpdateSubtitleOverlay();
+
+            if (!waveformVisible)
+            {
+                waveformVisible = true;
+                waveformPanel.Visible = true;
+                waveformButton.Text = "Waveform: On";
+                LayoutSubtitleOverlay();
+            }
+
+            waveformEditInProgress = false;
+            await EnsureWaveformLoadedAsync();
+            UpdateWaveformSentences();
+            waveformTimer.Start();
+            await UpdateWaveformPlaybackAsync();
+
+            if (!sentenceModeEnabled && transcriptSegments.Count > 0 && mpv != null)
+            {
+                sentenceModeEnabled = true;
+                UpdateSentenceModeButtons();
+                await LoadSentenceSegmentsIntoPlayerAsync();
+                await StartSentenceModeAtCurrentPositionAsync();
+            }
         }
 
         private async Task ToggleSubtitlesAsync()
@@ -743,57 +744,6 @@ namespace ShadowingPlayer
             {
                 statusLabel.Text = ex.Message;
             }
-        }
-
-        private Task AdjustSentenceBoundaryAsync(bool adjustStart, int direction)
-        {
-            return RunSegmentEditAsync(async delegate
-            {
-                if (mpv == null || transcriptSegments.Count == 0)
-                {
-                    statusLabel.Text = "Transcribe the video first.";
-                    return;
-                }
-
-                await PauseForBoundaryAdjustmentAsync();
-
-                var targetIndex = ClampSentenceIndex(currentSentenceIndex < 0 ? 0 : currentSentenceIndex);
-                if (targetIndex < 0)
-                {
-                    return;
-                }
-
-                currentSentenceIndex = targetIndex;
-                var changed = adjustStart
-                    ? AdjustSentenceStart(targetIndex, direction)
-                    : AdjustSentenceEnd(targetIndex, direction);
-
-                if (!changed)
-                {
-                    statusLabel.Text = "Sentence boundary cannot move further.";
-                    return;
-                }
-
-                var boundary = adjustStart
-                    ? transcriptSegments[targetIndex].Start
-                    : GetEffectiveSentenceEnd(targetIndex);
-
-                await CommitTranscriptStructureChangeAsync("Adjusted transcript timing.");
-                statusLabel.Text =
-                    "Sentence " + (targetIndex + 1) + " " +
-                    (adjustStart ? "start" : "end") + " " +
-                    FormatDisplayTime(boundary);
-            });
-        }
-
-        private bool AdjustSentenceStart(int sentenceIndex, int direction)
-        {
-            return SetSentenceStart(sentenceIndex, AddStep(transcriptSegments[sentenceIndex].Start, direction));
-        }
-
-        private bool AdjustSentenceEnd(int sentenceIndex, int direction)
-        {
-            return SetSentenceEnd(sentenceIndex, AddStep(GetEffectiveSentenceEnd(sentenceIndex), direction));
         }
 
         private bool SetSentenceStart(int sentenceIndex, TimeSpan requested)
@@ -1423,16 +1373,6 @@ namespace ShadowingPlayer
             return end;
         }
 
-        private TimeSpan AddStep(TimeSpan value, int direction)
-        {
-            return value + TimeSpan.FromTicks(GetTimingStep().Ticks * direction);
-        }
-
-        private TimeSpan GetTimingStep()
-        {
-            return TimeSpan.FromSeconds((double)timingStepInput.Value);
-        }
-
         private static TimeSpan Clamp(TimeSpan value, TimeSpan minimum, TimeSpan maximum)
         {
             if (maximum < minimum)
@@ -1461,11 +1401,6 @@ namespace ShadowingPlayer
             previousSentenceButton.Enabled = hasSentences && sentenceModeEnabled;
             repeatSentenceButton.Enabled = hasSentences && sentenceModeEnabled;
             nextSentenceButton.Enabled = hasSentences && sentenceModeEnabled;
-            sentenceStartEarlierButton.Enabled = hasSentences;
-            sentenceStartLaterButton.Enabled = hasSentences;
-            sentenceEndEarlierButton.Enabled = hasSentences;
-            sentenceEndLaterButton.Enabled = hasSentences;
-            timingStepInput.Enabled = hasSentences;
             sentenceModeButton.Text = sentenceModeEnabled ? "Sentence: On" : "Sentence: Off";
         }
 
@@ -1854,6 +1789,46 @@ namespace ShadowingPlayer
             var safeModelName = string.IsNullOrWhiteSpace(modelName) ? "small" : modelName.Replace('/', '-').Replace('\\', '-');
             var fileName = Path.GetFileNameWithoutExtension(videoPath) + ".shadowing." + safeModelName + ".srt";
             return string.IsNullOrEmpty(directory) ? fileName : Path.Combine(directory, fileName);
+        }
+
+        private static string GetBestTranscriptCachePath(string videoPath)
+        {
+            string bestPath = null;
+            var bestRank = -1;
+
+            foreach (var modelName in GetKnownWhisperModels())
+            {
+                var transcriptPath = GetTranscriptCachePath(videoPath, modelName);
+                if (!File.Exists(transcriptPath))
+                {
+                    continue;
+                }
+
+                var rank = GetWhisperModelRank(modelName);
+                if (rank > bestRank)
+                {
+                    bestRank = rank;
+                    bestPath = transcriptPath;
+                }
+            }
+
+            return bestPath;
+        }
+
+        private static string GetTranscriptModelNameFromPath(string videoPath, string transcriptPath)
+        {
+            foreach (var modelName in GetKnownWhisperModels())
+            {
+                if (string.Equals(
+                    GetTranscriptCachePath(videoPath, modelName),
+                    transcriptPath,
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    return modelName;
+                }
+            }
+
+            return "small";
         }
 
         private static string GetSharedTimingPath(string videoPath)
